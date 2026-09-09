@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="778" height="700" viewBox="0 0 778 700">
+<defs><marker id="ah" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+<path d="M0,0 L7,3.5 L0,7 z" fill="#d02020"/></marker></defs>
+<rect width="778" height="700" fill="#f7f7fa"/>
+<g transform="translate(0,0)">
+  <clipPath id="cp0"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp0)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.22" stroke="#4f81bd" stroke-width="1" />
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="none" stroke="rgba(240,160,48,0.45)" stroke-width="13" stroke-linejoin="miter"/><path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="none" stroke="rgba(240,160,48,0.45)" stroke-width="13" stroke-linejoin="miter"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">1  stroke all, all polys</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">no adjacency, no depth test</text>
+</g>
+<g transform="translate(264,0)">
+  <clipPath id="cp1"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp1)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.1" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/>
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 11.3 18.6 L 132.4 34.4 L 113.7 155.5 L 15.7 173.8 Z" fill="none" stroke="#d02020" stroke-width="1.6"/><path d="M 269.4 20.0 L 199.4 52.1 L 244.7 181.2 L 147.9 196.9 L 101.1 152.4 L 119.4 34.0 Z" fill="none" stroke="#d02020" stroke-width="1.6"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">2  expand all, all polys</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">no adjacency, no depth test</text>
+</g>
+<g transform="translate(528,0)">
+  <clipPath id="cp2"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp2)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.22" stroke="#4f81bd" stroke-width="1" />
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="none" stroke="rgba(240,160,48,0.45)" stroke-width="13" stroke-linejoin="miter"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">3  stroke all, farther only</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">depth test, whole boundary</text>
+</g>
+<g transform="translate(0,238)">
+  <clipPath id="cp3"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp3)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.1" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/>
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 11.3 18.6 L 132.4 34.4 L 113.7 155.5 L 15.7 173.8 Z" fill="none" stroke="#d02020" stroke-width="1.6"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">4  expand all, farther only</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">depth test, whole boundary</text>
+</g>
+<g transform="translate(264,238)">
+  <clipPath id="cp4"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp4)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.22" stroke="#4f81bd" stroke-width="1" />
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 125.0 40.0 L 108.0 150.0" fill="none" stroke="rgba(240,160,48,0.45)" stroke-width="13" stroke-linejoin="miter"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">5  stroke the shared edge</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">separate path, straddles the edge</text>
+</g>
+<g transform="translate(528,238)">
+  <clipPath id="cp5"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp5)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.1" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/>
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 18.0 26.0 L 131.4 40.8 L 114.8 148.7 L 22.0 166.0 Z" fill="#f0a030" fill-opacity="0.18" stroke="#f0a030" stroke-width="1.6"/><line x1="125.0" y1="40.0" x2="131.4" y2="40.8" stroke="#d02020" stroke-width="1.2" marker-end="url(#ah)"/><line x1="108.0" y1="150.0" x2="114.8" y2="148.7" stroke="#d02020" stroke-width="1.2" marker-end="url(#ah)"/><circle cx="131.4" cy="40.8" r="3.2" fill="#d02020"/><circle cx="114.8" cy="148.7" r="3.2" fill="#d02020"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">6  expand edge, move verts</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">a and b travel; adjacent edges slide</text>
+</g>
+<g transform="translate(0,476)">
+  <clipPath id="cp6"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp6)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.1" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/>
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 18.0 26.0 L 125.0 40.0 L 131.4 41.0 L 114.4 151.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#f0a030" fill-opacity="0.18" stroke="#f0a030" stroke-width="1.6"/><circle cx="131.4" cy="41.0" r="3.2" fill="#2e8b3d"/><circle cx="114.4" cy="151.0" r="3.2" fill="#2e8b3d"/><text x="136.42373941888374" y="37.992759728372945" font-family="monospace" font-size="10" fill="#2e8b3d">a'</text><text x="119.42373941888374" y="162.99275972837293" font-family="monospace" font-size="10" fill="#2e8b3d">b'</text></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">7  add 2 verts, along normal</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">a and b stay; corners stick out</text>
+</g>
+<g transform="translate(264,476)">
+  <clipPath id="cp7"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp7)">
+  <path d="M 232.0 30.0 L 191.3 48.7 L 236.0 176.0 L 150.0 190.0 L 108.0 150.0 L 125.0 40.0 Z" fill="#c0504d" fill-opacity="0.20" stroke="#c0504d" stroke-width="1"/>
+  <path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 22.0 166.0 Z" fill="#4f81bd" fill-opacity="0.1" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/>
+  <line x1="125" y1="40" x2="108" y2="150" stroke="#1c1c22" stroke-width="1.6"/>
+  <circle cx="125" cy="40" r="2.6" fill="#1c1c22"/>
+  <circle cx="108" cy="150" r="2.6" fill="#1c1c22"/>
+  <text x="131" y="36" font-family="monospace" font-size="11" fill="#1c1c22">a</text>
+  <text x="114" y="163" font-family="monospace" font-size="11" fill="#1c1c22">b</text><path d="M 18.0 26.0 L 125.0 40.0 L 131.4 40.8 L 113.7 155.5 L 108.0 150.0 L 22.0 166.0 Z" fill="#f0a030" fill-opacity="0.18" stroke="#f0a030" stroke-width="1.6"/><line x1="125" y1="40" x2="191.34" y2="48.68" stroke="#c0504d" stroke-width="0.9" stroke-dasharray="2 2"/><line x1="108" y1="150" x2="150" y2="190" stroke="#c0504d" stroke-width="0.9" stroke-dasharray="2 2"/><circle cx="131.4" cy="40.8" r="3.2" fill="#2e8b3d"/><circle cx="113.7" cy="155.5" r="3.2" fill="#2e8b3d"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">8  add 2 verts, neighbour dir</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">corner lands on a line Q owns</text>
+</g>
+<g transform="translate(528,476)">
+  <clipPath id="cp8"><rect x="0" y="0" width="250" height="190"/></clipPath>
+  <rect x="0" y="0" width="250" height="190" fill="#fff" stroke="#dcdce4"/>
+  <g clip-path="url(#cp8)"><path d="M 18.0 26.0 L 125.0 40.0 L 108.0 150.0 L 126.0 246.0 L 22.0 250.0 Z" fill="#4f81bd" fill-opacity="0.10" stroke="#4f81bd" stroke-width="1" stroke-dasharray="3 2"/><path d="M 18.0 26.0 L 125.0 40.0 L 131.4 40.8 L 114.6 149.9 L 132.6 245.7 L 126.0 246.0 L 22.0 250.0 Z" fill="#f0a030" fill-opacity="0.18" stroke="#f0a030" stroke-width="1.6"/><circle cx="131.4" cy="40.8" r="3.2" fill="#2e8b3d"/><circle cx="114.6" cy="149.9" r="4.2" fill="#2e8b3d"/><circle cx="132.6" cy="245.7" r="3.2" fill="#2e8b3d"/><text x="120.59347912001273" y="153.89444401518526" font-family="monospace" font-size="10" fill="#2e8b3d">mitre</text><circle cx="108" cy="150" r="2.6" fill="#1c1c22"/></g>
+  <text x="4" y="204" font-family="monospace" font-size="12" font-weight="bold" fill="#1c1c22">8b  + mitre at run interiors</text>
+  <text x="4" y="217" font-family="monospace" font-size="10" fill="#8a8a96">no notch back to the shared vertex</text>
+</g>
+</svg>

@@ -1,0 +1,588 @@
+<meta charset="utf-8">
+<title>seam band vs outset</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+  canvas.pv { border:1px solid #333; width:340px; height:238px; }
+  canvas.zm { border:1px solid #333; image-rendering:pixelated; }
+  .lbl { color:#8fd; margin-top:8px; }
+  pre { white-space:pre; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+<div id="previews"></div>
+<script src="harness.js"></script>
+<script src="cube.js"></script>
+<script src="band.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Two gap repairs, measured against each other.
+//
+//   OUTSET (4.8)  move the farther polygon's shared edges outward half a
+//                 pixel, re-intersecting at the vertices.
+//   BAND (this)   move nothing.  Stroke the farther polygon's shared edges,
+//                 in screen space, with that polygon's own texture on the
+//                 pattern.  Half the band lands inside the polygon, where it
+//                 repaints texels that are already there; half lands outside,
+//                 where the nearer polygon covers it.
+//
+// The metric is stricter than the one in cubepage.html, which compared against
+// a BINARY interior mask and therefore had to erode away the silhouette ring
+// -- exactly where an outset's damage lives.  Here:
+//
+//   alphaTrue   = box-filtered SSx render of the union as ONE path, one fill.
+//                 No internal seam exists in a single fill, so this is the
+//                 exact coverage of the object, fractional on the silhouette
+//                 included.
+//   alphaStrat  = 1 - |white - black| / 255, from the strategy rendered twice
+//                 on a black and on a white background.  Opaque content, so
+//                 the only thing that can differ is background showing
+//                 through: this is coverage, exactly.
+//
+//   gap   = sum over pixels of max(0, alphaTrue - alphaStrat)   -- missing ink
+//   bloat = sum over pixels of max(0, alphaStrat - alphaTrue)   -- excess ink
+//
+// Both in pixels, both exact, no erosion and no threshold, and the pair
+// catches the two failure modes symmetrically.  A repair that closes the gap
+// by growing the object pays for it in bloat, and this says how much.
+// ---------------------------------------------------------------------------
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'band';
+const SS = Number(Q.get('ss') || 4);
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const raf = () => new Promise(r => requestAnimationFrame(r));
+const BG = '#101014';
+
+function minRounds(f, rounds, iters) {
+  let best = Infinity;
+  for (let r = 0; r < rounds; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) f();
+    const ms = (performance.now() - t0) / iters;
+    if (ms < best) best = ms;
+  }
+  return best;
+}
+function fillBG(ctx, W, H, css) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = css; ctx.fillRect(0, 0, W, H);
+}
+
+// --- SSx box-filtered render, read back in strips so a 4000x2800 surface
+// --- never has to be materialised as one ImageData
+function superFloat(prepare, draw, W, H, ss, bg, fg) {
+  const big = mkCanvas(W * ss, H * ss, { alpha: false, willReadFrequently: true });
+  prepare(ss);
+  fillBG(big.ctx, W * ss, H * ss, bg);
+  if (fg) big.ctx.fillStyle = fg;
+  draw(big.ctx, null);
+  big.ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const res = new Float32Array(W * H * 3);
+  const inv = 1 / (ss * ss), rowsPer = 16, rw = W * ss;
+  for (let y0 = 0; y0 < H; y0 += rowsPer) {
+    const nr = Math.min(rowsPer, H - y0);
+    const d = big.ctx.getImageData(0, y0 * ss, rw, nr * ss).data;
+    for (let y = 0; y < nr; y++) {
+      for (let x = 0; x < W; x++) {
+        let r = 0, g = 0, b = 0;
+        for (let sy = 0; sy < ss; sy++) {
+          let o = ((y * ss + sy) * rw + x * ss) * 4;
+          for (let sx = 0; sx < ss; sx++) { r += d[o]; g += d[o + 1]; b += d[o + 2]; o += 4; }
+        }
+        const q = ((y0 + y) * W + x) * 3;
+        res[q] = r * inv; res[q + 1] = g * inv; res[q + 2] = b * inv;
+      }
+    }
+  }
+  big.c.width = big.c.height = 1;
+  return res;
+}
+
+// exact coverage of the object: white union on black, supersampled
+function alphaTrue(prepare, unionDraw, W, H, ss) {
+  const f = superFloat(prepare, (c) => { c.fillStyle = '#fff'; unionDraw(c); }, W, H, ss, '#000');
+  const a = new Float32Array(W * H);
+  for (let i = 0, q = 0; i < a.length; i++, q += 3) a[i] = f[q] / 255;
+  return a;
+}
+
+let RB = null, RW = null, RN = null;
+function readOnce(prepare, draw, W, H, bg, hold) {
+  prepare(1);
+  fillBG(hold.ctx, W, H, bg);
+  draw(hold.ctx, null);
+  hold.ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return hold.ctx.getImageData(0, 0, W, H).data;
+}
+
+// coverage of a strategy, exactly, from a black and a white background
+function alphaOf(prepare, draw, W, H) {
+  const b = readOnce(prepare, draw, W, H, '#000', RB);
+  const w = readOnce(prepare, draw, W, H, '#fff', RW);
+  const a = new Float32Array(W * H);
+  for (let i = 0, o = 0; i < a.length; i++, o += 4) {
+    const d = Math.max(Math.abs(w[o] - b[o]), Math.abs(w[o + 1] - b[o + 1]), Math.abs(w[o + 2] - b[o + 2]));
+    a[i] = 1 - d / 255;
+  }
+  return a;
+}
+
+// Split by where the pixel is, because the two regions answer two different
+// questions and mixing them hides both:
+//
+//   INTERIOR (alphaTrue = 1)  the object is solid here, so any missing
+//        coverage is a GAP -- the number 4.8 was driving to zero -- and any
+//        excess is impossible.  This is the honest gap metric.
+//   RING + OUTSIDE (alphaTrue < 1)  the object's own antialiased outline.
+//        Comparing coverage against a 4x box filter here measures the
+//        difference between Skia's analytic antialiasing and a box filter,
+//        which is not a defect, so an absolute number is meaningless.  What
+//        IS meaningful is the change relative to the untouched fill -- that
+//        is the repair moving the outline, and it is measured as
+//        outlineDelta below.
+function gapBloat(at, as, W, H, seamMask) {
+  let gapIn = 0, gapInPx = 0, wGapIn = 0, bloatIn = 0, wBloatIn = 0;
+  let gapRing = 0, bloatRing = 0, bloatOut = 0, wBloatOut = 0;
+  let gapInOff = 0;
+  for (let i = 0; i < at.length; i++) {
+    const t = at[i], d = t - as[i];
+    if (t >= 0.999) {
+      if (d > 0) {
+        gapIn += d; if (d > 0.02) gapInPx++;
+        if (d > wGapIn) wGapIn = d;
+        if (seamMask && !seamMask[i]) gapInOff += d;
+      } else if (d < 0) { bloatIn -= d; if (-d > wBloatIn) wBloatIn = -d; }
+    } else if (t <= 0.001) {
+      if (d < 0) { bloatOut -= d; if (-d > wBloatOut) wBloatOut = -d; }
+    } else {
+      if (d > 0) gapRing += d; else bloatRing -= d;
+    }
+  }
+  return { gapIn: +gapIn.toFixed(2), gapInPx, worstGapIn: +wGapIn.toFixed(3),
+           bloatIn: +bloatIn.toFixed(2), worstBloatIn: +wBloatIn.toFixed(3),
+           gapRing: +gapRing.toFixed(2), bloatRing: +bloatRing.toFixed(2),
+           bloatOut: +bloatOut.toFixed(2), worstBloatOut: +wBloatOut.toFixed(3),
+           gapInOffSeam: +gapInOff.toFixed(2) };
+}
+
+// The outline metric, with no reference in it at all: how much coverage did
+// this repair change anywhere the object is NOT solid, against the plain fill
+// -- which draws the true polygons and therefore has the true outline.  Zero
+// means the outline was not touched.
+function outlineDelta(at, as, asBase) {
+  let sum = 0, px = 0, worst = 0;
+  for (let i = 0; i < at.length; i++) {
+    if (at[i] >= 0.999) continue;
+    const d = Math.abs(as[i] - asBase[i]);
+    if (d > 0.02) px++;
+    sum += d;
+    if (d > worst) worst = d;
+  }
+  return { outline: +sum.toFixed(2), outlinePx: px, outlineWorst: +worst.toFixed(3) };
+}
+
+function compareFloat(ref, data, W, H, mask) {
+  let n = 0, g8 = 0, g48 = 0, sum = 0, sq = 0, maxd = 0, cnt = 0;
+  for (let i = 0, o = 0, q = 0; i < W * H; i++, o += 4, q += 3) {
+    if (mask && !mask[i]) continue;
+    cnt++;
+    const d0 = Math.abs(ref[q] - data[o]), d1 = Math.abs(ref[q + 1] - data[o + 1]),
+          d2 = Math.abs(ref[q + 2] - data[o + 2]);
+    const d = d0 > d1 ? (d0 > d2 ? d0 : d2) : (d1 > d2 ? d1 : d2);
+    if (d > 1) n++;
+    if (d > 8) g8++;
+    if (d > 48) g48++;
+    sum += d; sq += d * d;
+    if (d > maxd) maxd = d;
+  }
+  cnt = cnt || 1;
+  return { rmse: +Math.sqrt(sq / cnt).toFixed(3), mae: +(sum / cnt).toFixed(3),
+           maxDelta: +maxd.toFixed(1), gt8Pct: +(100 * g8 / cnt).toFixed(3),
+           gt48Pct: +(100 * g48 / cnt).toFixed(3), anyPct: +(100 * n / cnt).toFixed(3) };
+}
+function compareRefs(a, b, W, H) {
+  let sq = 0, maxd = 0;
+  for (let q = 0; q < a.length; q += 3) {
+    const d = Math.max(Math.abs(a[q] - b[q]), Math.abs(a[q + 1] - b[q + 1]), Math.abs(a[q + 2] - b[q + 2]));
+    sq += d * d; if (d > maxd) maxd = d;
+  }
+  return { rmse: +Math.sqrt(sq / (a.length / 3)).toFixed(3), maxDelta: +maxd.toFixed(1) };
+}
+
+// pixels within r of any of the shared-edge segments
+function segMask(segs, W, H, r) {
+  const m = new Uint8Array(W * H);
+  const r2 = r * r;
+  for (const s of segs) {
+    const x0 = Math.max(0, Math.floor(Math.min(s[0], s[2]) - r - 1));
+    const x1 = Math.min(W - 1, Math.ceil(Math.max(s[0], s[2]) + r + 1));
+    const y0 = Math.max(0, Math.floor(Math.min(s[1], s[3]) - r - 1));
+    const y1 = Math.min(H - 1, Math.ceil(Math.max(s[1], s[3]) + r + 1));
+    const dx = s[2] - s[0], dy = s[3] - s[1], L2 = dx * dx + dy * dy || 1;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      let t = ((x - s[0]) * dx + (y - s[1]) * dy) / L2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const px = s[0] + t * dx - x, py = s[1] + t * dy - y;
+      if (px * px + py * py <= r2) m[y * W + x] = 1;
+    }
+  }
+  return m;
+}
+
+// how much of the picture did this strategy disturb AWAY from the seam it was
+// supposed to be fixing?  0 is the claim the band makes for itself.
+function offSeamDelta(base, data, W, H, seamMask) {
+  let n = 0, g8 = 0, maxd = 0;
+  for (let i = 0, o = 0; i < W * H; i++, o += 4) {
+    if (seamMask[i]) continue;
+    const d = Math.max(Math.abs(base[o] - data[o]), Math.abs(base[o + 1] - data[o + 1]),
+                       Math.abs(base[o + 2] - data[o + 2]));
+    if (d > 1) n++;
+    if (d > 8) g8++;
+    if (d > maxd) maxd = d;
+  }
+  return { px: n, gt8: g8, maxDelta: maxd };
+}
+
+// --- acceleration verdict (A7), read rather than inferred -----------------
+// gfx.canvas.accelerated.debug = true makes Gecko paint a 16x16 green square
+// in the top-right corner of every canvas that is STILL accelerated, from
+// DrawTargetWebgl::EndFrame.  Read it through a separate software canvas
+// AFTER the case, so the probe cannot perturb what it measures.
+let probe = null, INDICATOR = false;
+function accelFraction(canvas) {
+  if (!probe) probe = mkCanvas(32, 32, { alpha: false, willReadFrequently: true });
+  const p = probe.ctx;
+  p.setTransform(1, 0, 0, 1, 0, 0);
+  p.fillStyle = '#000'; p.fillRect(0, 0, 32, 32);
+  p.drawImage(canvas, canvas.width - 16, 0, 16, 16, 0, 0, 16, 16);
+  const d = p.getImageData(3, 3, 10, 10).data;
+  let green = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) { n++; if (d[i] < 60 && d[i + 1] > 190 && d[i + 2] < 60) green++; }
+  return green / n;
+}
+function verdict(canvas) { return INDICATOR ? (accelFraction(canvas) > 0.8 ? 'ACCEL' : 'soft') : '-'; }
+
+// A FRESH canvas per case.  Firefox demotes a canvas to software permanently
+// and per canvas (3.2), so one shared canvas would hand every later case the
+// verdict of the worst earlier one -- which is exactly what a first run of
+// this page did.
+async function timeIt(prepare, draw, W, H) {
+  const gpu = mkCanvas(W, H, { alpha: false });
+  gpu.c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:224px';
+  document.body.appendChild(gpu.c);
+  const one = () => { prepare(1); fillBG(gpu.ctx, W, H, BG); draw(gpu.ctx, null); };
+  for (let i = 0; i < 4; i++) one();
+  const rec = minRounds(one, 5, 40);
+  await raf();
+  const reps = Math.max(8, Math.min(2048, Math.ceil(50 / Math.max(rec, 0.02))));
+  const per = await new Promise(resolve => {
+    let warm = 6, t0 = 0, cnt = 0, done = false;
+    const wd = setTimeout(() => { if (!done) { done = true; resolve(NaN); } }, 45000);
+    function step(ts) {
+      if (done) return;
+      if (warm > 0) { warm--; if (warm === 0) { t0 = ts; cnt = 0; } }
+      for (let k = 0; k < reps; k++) one();
+      if (warm === 0) cnt++;
+      if (warm === 0 && cnt >= 20) { done = true; clearTimeout(wd); resolve((ts - t0) / (cnt * reps)); return; }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+  // a plain rAF-paced pass on a second fresh canvas, and its verdict: the
+  // hammered loop above is not a frame, and demotion is scored per frame
+  const fresh = mkCanvas(W, H, { alpha: false });
+  fresh.c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:224px';
+  document.body.appendChild(fresh.c);
+  for (let i = 0; i < 24; i++) {
+    prepare(1); fillBG(fresh.ctx, W, H, BG); draw(fresh.ctx, null);
+    await raf();
+  }
+  const v = verdict(fresh.c);
+  const vHammer = verdict(gpu.c);
+  gpu.c.remove(); fresh.c.remove();
+  gpu.c.width = gpu.c.height = 1; fresh.c.width = fresh.c.height = 1;
+  return { recMs: +rec.toFixed(4), perDrawMs: +per.toFixed(4), reps, accel: v, accelHammer: vHammer };
+}
+
+// ---------------------------------------------------------------------------
+// fixture 1: the textured cube of 4.8 (S8)
+// ---------------------------------------------------------------------------
+const CANG = [0.55, 0.72, 3.4, 620];
+function cubePrepare(ss) {
+  cubeBuild(CANG[0], CANG[1], CANG[2], CANG[3]);
+  if (ss !== 1) for (let i = 0; i < 8; i++) { SX[i] *= ss; SY[i] *= ss; }
+}
+function cubeUnionDraw(ctx) {
+  ctx.beginPath();
+  for (let i = 0; i < nFaceVis; i++) {
+    const q = CUBE_F[FORD[i]];
+    ctx.moveTo(SX[q[0]], SY[q[0]]);
+    ctx.lineTo(SX[q[1]], SY[q[1]]);
+    ctx.lineTo(SX[q[2]], SY[q[2]]);
+    ctx.lineTo(SX[q[3]], SY[q[3]]);
+    ctx.closePath();
+  }
+  ctx.fill();
+}
+function cubeSeamSegs() {
+  const segs = [];
+  for (let i = 0; i < nFaceVis; i++) {
+    const f = FORD[i], q = CUBE_F[f];
+    for (let e = 0; e < 4; e++) {
+      const nb = CUBE_ADJ[f][e];
+      if (nb >= 0 && FVIS[nb] && FPOS[nb] > FPOS[f])
+        segs.push([SX[q[e]], SY[q[e]], SX[q[(e + 1) % 4]], SY[q[(e + 1) % 4]]]);
+    }
+  }
+  return segs;
+}
+
+const CUBE_FIX = {
+  id: 'S8', name: 'textured cube', W: CW, H: CH,
+  prepare: cubePrepare, union: cubeUnionDraw, segs: cubeSeamSegs,
+  base: (c, s) => drawPerFace(c, s, 0),
+  // references at SS: an outset of 1 DEVICE pixel closes a seam that is one
+  // device pixel wide, and a band of 2 device px does the same by the other
+  // mechanism.  If the two agree, the reference does not depend on the
+  // mechanism under test -- which is the whole question with a reference like
+  // this, so it is measured rather than asserted.
+  refs: [
+    ['fill only', (c, s) => drawPerFace(c, s, 0)],
+    ['outset 1 dev px', (c, s) => drawPerFace(c, s, 1)],
+    ['band 2 dev px', (c, s) => drawPerFaceSeamBand(c, s, 2, 'butt')],
+    ['quad band 2 dev px', (c, s) => drawPerFaceQuadBand(c, s, 2, 'centred')]
+  ],
+  cases: [
+    ['0 no repair', (c, s) => drawPerFace(c, s, 0)],
+    ['1 stroke all w1', (c, s) => optStrokeAll(c, s, 1.0, false)],
+    ['1 stroke all w2', (c, s) => optStrokeAll(c, s, 2.0, false)],
+    ['2 expand all 1px', (c, s) => optExpandAll(c, s, 1.0, false)],
+    ['3 stroke far w2', (c, s) => optStrokeAll(c, s, 2.0, true)],
+    ['4 expand far 1px', (c, s) => optExpandAll(c, s, 1.0, true)],
+    ['5 edge band, stroked', (c, s) => drawPerFaceSeamBand(c, s, 2.0, 'butt')],
+    ['5f edge band, filled', (c, s) => drawPerFaceQuadBand(c, s, 2.0, 'centred')],
+    ['5f filled + trimmed', (c, s) => drawPerFaceQuadBand(c, s, 2.0, 'centred', 1)],
+    ['6 move verts 1px', (c, s) => drawPerFace(c, s, 1.0)],
+    ['7 add verts 1px', (c, s) => drawPerFaceUnionBand(c, s, 1.0, 'inline')],
+    ['7 add verts 2px', (c, s) => drawPerFaceUnionBand(c, s, 2.0, 'inline')],
+    ['8 nb-dir 1px', (c, s) => optNeighbourBand(c, s, 1.0, 4)],
+    ['8b nb-end+mitre 1px', (c, s) => optNeighbourBandMitred(c, s, 1.0, 4)],
+    ['8b nb-end+mitre 2px', (c, s) => optNeighbourBandMitred(c, s, 2.0, 4)]
+  ]
+};
+
+// ---------------------------------------------------------------------------
+// fixture 2: two textured charts split by a sawtooth (S14)
+// ---------------------------------------------------------------------------
+const BAND_FIX = {
+  id: 'S14', name: 'sawtooth two-chart plane', W: BW, H: BH,
+  prepare: (ss) => bandBuild(ss),
+  union: (c) => bandUnion(c), segs: () => bandSeamSegs(),
+  base: (c, s) => bandFillOnly(c, s),
+  refs: [
+    ['fill only', (c, s) => bandFillOnly(c, s)],
+    ['outset 1 dev px', (c, s) => bandOutset(c, s, 1 / SS, 4)],
+    ['band 2 dev px', (c, s) => bandSeamBand(c, s, 2 / SS, 'butt')],
+    ['quad band 2 dev px', (c, s) => bandQuadBand(c, s, 2 / SS, 'centred')]
+  ],
+  cases: [
+    ['0 no repair', (c, s) => bandFillOnly(c, s)],
+    ['1 stroke all w1', (c, s) => bandOptStrokeAll(c, s, 1.0, false)],
+    ['1 stroke all w2', (c, s) => bandOptStrokeAll(c, s, 2.0, false)],
+    ['2 expand all 1px', (c, s) => bandOptExpandAll(c, s, 1.0, false)],
+    ['3 stroke far w2', (c, s) => bandOptStrokeAll(c, s, 2.0, true)],
+    ['4 expand far 1px', (c, s) => bandOptExpandAll(c, s, 1.0, true)],
+    ['5 edge band, stroked', (c, s) => bandSeamBand(c, s, 2.0, 'butt')],
+    ['5f edge band, filled', (c, s) => bandQuadBand(c, s, 2.0, 'centred')],
+    ['5f filled + trimmed', (c, s) => bandQuadBand(c, s, 2.0, 'centred', 1)],
+    ['6 move verts 1px', (c, s) => bandOutset(c, s, 1.0, 4)],
+    ['7 add verts 1px', (c, s) => bandUnionBand(c, s, 1.0, 'inline')],
+    ['7 add verts 2px', (c, s) => bandUnionBand(c, s, 2.0, 'inline')],
+    ['8 nb-dir 1px', (c, s) => bandOptNeighbour(c, s, 1.0, 4)],
+    ['8b nb-end+mitre 1px', (c, s) => bandOptNeighbourMitred(c, s, 1.0, 4)],
+    ['8b nb-end+mitre 2px', (c, s) => bandOptNeighbourMitred(c, s, 2.0, 4)]
+  ]
+};
+
+async function runFixture(fx, RES) {
+  const W = fx.W, H = fx.H;
+  RB = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+  RW = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+  RN = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+
+  log('\n' + '='.repeat(112));
+  log('FIXTURE ' + fx.id + ': ' + fx.name + ', ' + W + 'x' + H + ', supersample ' + SS + 'x');
+  log('='.repeat(112));
+
+  fx.prepare(1);
+  const segs = fx.segs();
+  const mask = segMask(segs, W, H, 3);
+  let maskPx = 0; for (let i = 0; i < mask.length; i++) maskPx += mask[i];
+  log('shared (seam) edge segments: ' + segs.length + ';  pixels within 3px of one: ' + maskPx);
+
+  statusEl.textContent = fx.id + ' alphaTrue';
+  const at = alphaTrue(fx.prepare, fx.union, W, H, SS);
+  { let s = 0, frac = 0; for (let i = 0; i < at.length; i++) { s += at[i]; if (at[i] > 0.002 && at[i] < 0.998) frac++; }
+    log('exact object coverage: ' + s.toFixed(1) + ' px total, ' + frac + ' partially covered (the silhouette)'); }
+
+  // references, and whether the choice of reference matters
+  const refs = [];
+  for (const [rl, rd] of fx.refs) {
+    statusEl.textContent = fx.id + ' ref ' + rl;
+    await raf();
+    refs.push([rl, superFloat(fx.prepare, rd, W, H, SS, BG)]);
+  }
+  log('\nreference cross-check (' + SS + 'x box-filtered, RMSE between references):');
+  for (let i = 0; i < refs.length; i++) for (let j = i + 1; j < refs.length; j++) {
+    const c = compareRefs(refs[i][1], refs[j][1], W, H);
+    log('  ' + pad(refs[i][0] + ' vs ' + refs[j][0], 34) + ' RMSE ' + rp(c.rmse, 7) + '   max ' + rp(c.maxDelta, 6));
+    RES.notes.push({ case: fx.id + ' ref ' + refs[i][0] + ' vs ' + refs[j][0], rmse: c.rmse, maxDelta: c.maxDelta });
+  }
+  // authoritative = the seam-free pair; they are cross-checked above
+  const REF = refs[1][1], REFNAME = refs[1][0];
+  log('authoritative reference: ' + REFNAME + ' (the 4.8 mechanism at ' + SS + 'x, seam closed by one device pixel)');
+
+  // interior-only masks: where the object is solid, so a coverage deficit is
+  // unambiguously a gap and a colour difference is unambiguously an artifact
+  const interior = new Uint8Array(W * H), seamIn = new Uint8Array(W * H);
+  let nIn = 0, nSeamIn = 0;
+  for (let i = 0; i < interior.length; i++) {
+    if (at[i] >= 0.999) { interior[i] = 1; nIn++; if (mask[i]) { seamIn[i] = 1; nSeamIn++; } }
+  }
+  log('strictly interior pixels: ' + nIn + ';  interior and within 3px of a seam: ' + nSeamIn);
+
+  fx.prepare(1);
+  const baseImg = readOnce(fx.prepare, fx.base, W, H, BG, RN).slice();
+  const baseAlpha = alphaOf(fx.prepare, fx.base, W, H);
+
+  log('');
+  log(pad('strategy', 25) + rp('ops', 4) + rp('recMs', 8) + rp('perDraw', 9) +
+      ' | ' + rp('gapIn', 8) + rp('wGapIn', 8) + rp('outline', 9) + rp('wOutl', 7) +
+      ' | ' + rp('seamRMSE', 9) + rp('seamMax', 8) + rp('RMSE', 7) +
+      ' | ' + rp('offSeamPx', 10) + rp('>8', 6) + rp('accel', 8));
+  const rows = [];
+  for (const [label, draw] of fx.cases) {
+    statusEl.textContent = fx.id + ' ' + label;
+    await raf();
+    const st = {};
+    fx.prepare(1);
+    draw(RN.ctx, st);
+    const t = await timeIt(fx.prepare, draw, W, H);
+    const as = alphaOf(fx.prepare, draw, W, H);
+    const gb = gapBloat(at, as, W, H, mask);
+    const od = outlineDelta(at, as, baseAlpha);
+    const img = readOnce(fx.prepare, draw, W, H, BG, RN);
+    const cmp = compareFloat(REF, img, W, H, interior);
+    const cmpSeam = compareFloat(REF, img, W, H, seamIn);
+    const off = offSeamDelta(baseImg, img, W, H, mask);
+    const row = Object.assign({ case: label, ops: st.ops, fills: st.fills, strokes: st.strokes || 0,
+                  recMs: t.recMs, perDrawMs: t.perDrawMs, reps: t.reps,
+                  accel: t.accel, accelHammer: t.accelHammer, verts: st.verts || 0 },
+                gb, od,
+                { rmse: cmp.rmse, mae: cmp.mae, maxDelta: cmp.maxDelta, gt8Pct: cmp.gt8Pct,
+                  seamRmse: cmpSeam.rmse, seamMaxDelta: cmpSeam.maxDelta, seamGt8Pct: cmpSeam.gt8Pct,
+                  offSeamPx: off.px, offSeamGt8: off.gt8, offSeamMax: off.maxDelta });
+    rows.push(row); RES.notes.push(Object.assign({ fixture: fx.id }, row));
+    log(pad(label, 25) + rp(st.ops, 4) + rp(t.recMs.toFixed(3), 8) + rp(t.perDrawMs.toFixed(4), 9) +
+        ' | ' + rp(gb.gapIn.toFixed(2), 8) + rp(gb.worstGapIn.toFixed(3), 8) +
+        rp(od.outline.toFixed(2), 9) + rp(od.outlineWorst.toFixed(3), 7) +
+        ' | ' + rp(cmpSeam.rmse.toFixed(3), 9) + rp(cmpSeam.maxDelta, 8) + rp(cmp.rmse.toFixed(3), 7) +
+        ' | ' + rp(off.px, 10) + rp(off.gt8, 6) + rp(t.accel, 8));
+  }
+  RES.scenes.push({ name: fx.id + ' ' + fx.name, rows });
+
+  // previews: full frame on magenta, and a 8x zoom on the seam
+  const pv = document.getElementById('previews');
+  const zc = segs.length ? segs[0] : [W / 2, H / 2, W / 2, H / 2];
+  const zx = Math.max(0, Math.round((zc[0] + zc[2]) / 2) - 24);
+  const zy = Math.max(0, Math.round((zc[1] + zc[3]) / 2) - 17);
+  for (const [label, draw] of fx.cases) {
+    fx.prepare(1);
+    const c = mkCanvas(W, H, { alpha: false });
+    fillBG(c.ctx, W, H, '#ff00ff');
+    draw(c.ctx, null);
+    c.c.className = 'pv';
+    const z = mkCanvas(48 * 8, 34 * 8, { alpha: false });
+    z.ctx.imageSmoothingEnabled = false;
+    z.ctx.drawImage(c.c, zx, zy, 48, 34, 0, 0, 48 * 8, 34 * 8);
+    z.c.className = 'zm';
+    const d = document.createElement('div'); d.className = 'lbl';
+    d.textContent = fx.id + '  ' + label;
+    pv.appendChild(d); pv.appendChild(c.c); pv.appendChild(z.c);
+  }
+  for (const c of [RB, RW, RN]) { c.c.width = c.c.height = 1; }
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }), 5000);
+  const RES = { env: { tag: TAG, ua: navigator.userAgent, ss: SS }, scenes: [], micro: [], notes: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent);
+  log('CanvasPattern.setTransform supported: ' + PATTERN_SETTRANSFORM +
+      '   (the band needs it to keep lineWidth in device pixels)');
+  RES.notes.push({ case: 'pattern.setTransform', ok: PATTERN_SETTRANSFORM });
+
+  // Is Gecko's acceleration indicator on?  A canvas that only fillRects can
+  // never be demoted, so if the indicator exists at all this corner is green.
+  {
+    const ctrl = mkCanvas(400, 300, { alpha: false });
+    ctrl.c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:240px';
+    document.body.appendChild(ctrl.c);
+    for (let i = 0; i < 4; i++) {
+      ctrl.ctx.fillStyle = '#204060'; ctrl.ctx.fillRect(0, 0, 400, 300);
+      await raf();
+    }
+    const frac = accelFraction(ctrl.c);
+    INDICATOR = frac > 0.8;
+    ctrl.c.remove(); ctrl.c.width = ctrl.c.height = 1;
+    log('acceleration indicator: ' + (INDICATOR ? 'ON (accel column is a read, not an inference)'
+        : 'off (run the firefox-dbg target for the accel column)') + '  fraction ' + frac.toFixed(3));
+    RES.notes.push({ case: 'accel indicator', on: INDICATOR, fraction: +frac.toFixed(3) });
+  }
+
+  // both textures must be opaque or every gap number is the fixture leaking
+  for (const [nm, tex, n] of [['cube atlas', CUBE_TEXTURE, CTEX], ['band atlas', BAND_TEXTURE, BTEX_N]]) {
+    const t = mkCanvas(n, n, { alpha: true, willReadFrequently: true });
+    t.ctx.drawImage(tex, 0, 0);
+    const d = t.ctx.getImageData(0, 0, n, n).data;
+    let minA = 255, nLt = 0, miss = 0;
+    for (let i = 3; i < d.length; i += 4) {
+      if (d[i] < minA) minA = d[i];
+      if (d[i] < 255) { nLt++; miss += (255 - d[i]) / 255; }
+    }
+    log(nm + ' opacity: min alpha ' + minA + ', ' + nLt + ' texels below 255, missing ' + miss.toFixed(1));
+    RES.notes.push({ case: nm + ' opacity', minAlpha: minA, belowPx: nLt, missing: +miss.toFixed(1) });
+    t.c.width = t.c.height = 1;
+  }
+
+  cubePrepare(1);
+  const sbc = seamBandCounts();
+  log('\ncube: ' + nFaceVis + ' visible faces, order ' + Array.from(FORD.slice(0, nFaceVis)).join(',') +
+      ';  seam edges to band ' + sbc.edges + ' on ' + sbc.faces + ' faces' +
+      '  -> ' + nFaceVis + ' fills + ' + sbc.faces + ' strokes');
+  bandBuild(1);
+  const bg2 = bandGeometry();
+  log('sawtooth chart P: ' + bg2.verts + ' vertices, ' + bg2.reflex + ' reflex corners, ' +
+      'sharpest interior angle ' + bg2.minInteriorDeg + ' deg, ' +
+      bg2.sharedEdges + ' shared edges spanning ' + bg2.sharedLenPx + ' px');
+  RES.notes.push(Object.assign({ case: 'S14 geometry' }, bg2));
+  RES.notes.push(Object.assign({ case: 'S8 band counts' }, sbc));
+
+  await runFixture(CUBE_FIX, RES);
+  await runFixture(BAND_FIX, RES);
+
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'complete', recMs: 0, rasterMs: 0 });
+  await post(TAG, RES);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>

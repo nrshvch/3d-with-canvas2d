@@ -1,0 +1,484 @@
+<meta charset="utf-8">
+<title>fog: composite ops, demotion, and architectures</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Three questions, in order of how much they decide:
+//
+// 1. WHAT DOES EACH COMPOSITE OP COST, full-canvas?  Measured as a delta: every
+//    rep restores the target with `copy` (OP_SOURCE, accelerated) and then
+//    applies the op, and the cost of a restore-only rep is subtracted.  Without
+//    the restore, `lighter` saturates to white and `multiply` to black within a
+//    few reps, and you end up measuring saturated-content early-outs.
+//
+// 2. DOES THE OP DEMOTE THE CANVAS?  An unsupported op is software EVERY frame
+//    whether or not the canvas is demoted -- what demotion changes is that all
+//    the GEOMETRY on that canvas becomes software too.  So the probe has to
+//    draw geometry as well, on a FRESH canvas, and watch for the step.  This is
+//    the measurement that answers "why does it fall back after ~10 frames".
+//
+// 3. WHICH FOG ARCHITECTURE WINS end-to-end.  A = the usual keep+invert chain,
+//    B = keep+add with no invert at all, D = fog folded into the palette so the
+//    albedo and shade passes collapse into one and there is no composite left.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'fog';
+const QUICK = Q.get('quick') === '1';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+// `micro` is what bench/run.js's waitFor() looks for to decide the page is
+// done; leave it empty and the runner blocks for its full 15-minute timeout
+// on a page that already finished.
+const results = { tag: TAG, micro: [], ops: [], demote: [], arch: [] };
+
+function mk(w, h, opts) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return { c, ctx: c.getContext('2d', opts || { alpha: false }) };
+}
+
+// ---------------------------------------------------------------------------
+// auto-calibrating sustained measurement.  Total wall / frames, so GPU time is
+// included by construction (2); reps sized so one callback is far above one
+// vsync, or the number is just 16.7 ms (2).
+// ---------------------------------------------------------------------------
+function once(fn, reps) { for (let i = 0; i < reps; i++) fn(); }
+// budgetMs caps the wall clock: stop at `frames` frames OR when the budget is
+// spent (never below MINF frames, so a number is always returned).  Without
+// this, a canvas that demotes mid-measurement can turn a 45 ms frame into a
+// 33-SECOND one and hang the whole run.
+const MINF = 8;
+function sustained(fn, reps, frames, budgetMs) {
+  budgetMs = budgetMs || 4000;
+  return new Promise(resolve => {
+    let t0 = 0, warm = 3;
+    const cpu = [];
+    const wall0 = performance.now();
+    function done(ts) {
+      let s = 0; for (const v of cpu) s += v;
+      const wall = (ts - t0) / cpu.length;
+      resolve({ perFrame: wall, cpu: s / cpu.length, reps, frames: cpu.length,
+                truncated: cpu.length < frames,
+                perRep: wall / reps, cpuPerRep: (s / cpu.length) / reps });
+    }
+    function step(ts) {
+      if (warm > 0) { warm--; once(fn, reps); if (warm === 0) t0 = ts; requestAnimationFrame(step); return; }
+      const c0 = performance.now();
+      once(fn, reps);
+      cpu.push(performance.now() - c0);
+      const spent = performance.now() - wall0;
+      if (cpu.length >= frames || (cpu.length >= MINF && spent > budgetMs)) { done(performance.now()); return; }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+// A full-canvas blend on an accelerated backend can be so cheap that several
+// THOUSAND of them still fit inside one vsync, and then the loop is measuring
+// vsync, not the op (2).  The cap has to be high enough to escape that, and
+// `vsyncBound` records whether it managed to.
+const REPCAP = 2048;
+async function calibrated(fn, targetMs, frames) {
+  // Ramp in bounded steps (at most 8x per step), each probe short and
+  // budgeted, so no single probe can run away.
+  let reps = 8, per = 0;
+  for (let i = 0; i < 9; i++) {
+    const r = await sustained(fn, reps, 5, 1500);
+    per = r.perFrame / reps;
+    if (r.perFrame >= targetMs || reps >= REPCAP || r.truncated) break;
+    const scale = Math.min(8, Math.max(2, targetMs / Math.max(0.02, r.perFrame)));
+    const want = Math.min(REPCAP, Math.ceil(reps * scale));
+    if (want <= reps) break;
+    reps = want;
+  }
+  if (per > 0) reps = Math.max(1, Math.min(REPCAP, Math.round(targetMs / per)));
+  const r = await sustained(fn, reps, frames, 4000);
+  r.vsyncBound = r.perFrame < targetMs * 0.6;
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// PART 1 -- composite ops, full canvas, as a delta against the restore
+// ---------------------------------------------------------------------------
+async function part1() {
+  statusEl.textContent = 'part 1: composite ops…';
+  // pristine sources, opaque.  The fog map is a grey ramp with structure, so a
+  // constant-colour fast path cannot flatter it.
+  const src = mk(W, H), fog = mk(W, H);
+  const g = src.ctx.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, '#3a5f8a'); g.addColorStop(1, '#c47a3f');
+  src.ctx.fillStyle = g; src.ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 400; i++) {
+    src.ctx.fillStyle = 'hsl(' + (i * 7 % 360) + ',50%,' + (20 + i % 60) + '%)';
+    src.ctx.fillRect((i * 137) % W, (i * 71) % H, 40, 30);
+  }
+  const g2 = fog.ctx.createLinearGradient(0, 0, 0, H);
+  g2.addColorStop(0, '#000'); g2.addColorStop(1, '#fff');
+  fog.ctx.fillStyle = g2; fog.ctx.fillRect(0, 0, W, H);
+
+  // A fresh target per case: an unsupported op demotes the canvas it runs on
+  // (3.2), and a demoted canvas would make every op measured after it look
+  // slow for the wrong reason.
+  let tgt = mk(W, H), t = tgt.ctx;
+  const restore = () => { t.globalCompositeOperation = 'copy'; t.drawImage(src.c, 0, 0); };
+  const cases = [
+    ['restore only (baseline)', () => { restore(); }],
+    ['source-over', () => { restore(); t.globalCompositeOperation = 'source-over'; t.drawImage(fog.c, 0, 0); }],
+    ['multiply', () => { restore(); t.globalCompositeOperation = 'multiply'; t.drawImage(fog.c, 0, 0); }],
+    ['screen', () => { restore(); t.globalCompositeOperation = 'screen'; t.drawImage(fog.c, 0, 0); }],
+    ['lighter  (OP_ADD)', () => { restore(); t.globalCompositeOperation = 'lighter'; t.drawImage(fog.c, 0, 0); }],
+    ['difference', () => { restore(); t.globalCompositeOperation = 'difference'; t.drawImage(fog.c, 0, 0); }],
+    ['difference + white rect (invert in place)',
+      () => { restore(); t.globalCompositeOperation = 'difference'; t.fillStyle = '#fff'; t.fillRect(0, 0, W, H); }],
+    ['filter invert(1) + drawImage',
+      () => { restore(); t.globalCompositeOperation = 'source-over'; t.filter = 'invert(1)'; t.drawImage(fog.c, 0, 0); t.filter = 'none'; }],
+    ['filter invert(1) + self drawImage',
+      () => { restore(); t.globalCompositeOperation = 'source-over'; t.filter = 'invert(1)'; t.drawImage(t.canvas, 0, 0); t.filter = 'none'; }]
+  ];
+  log('PART 1 -- full-canvas composite, ' + W + 'x' + H + ', cost per operation');
+  log('  ' + pd('operation', 42) + rp('perRep', 9) + rp('cpuRep', 9) + rp('minus base', 12) + rp('reps', 6) + rp('fr', 5));
+  let baseline = 0;
+  for (const [name, fn] of cases) {
+    tgt = mk(W, H); t = tgt.ctx;              // fresh, undemoted target
+    const r = await calibrated(fn, QUICK ? 20 : 45, QUICK ? 30 : 60);
+    if (baseline === 0) baseline = r.perRep;
+    const net = r.perRep - baseline;
+    log('  ' + pd(name, 42) + rp(r.perRep.toFixed(4), 9) + rp(r.cpuPerRep.toFixed(4), 9) +
+      rp(baseline === r.perRep ? '--' : net.toFixed(4), 12) + rp(r.reps, 6) +
+      rp(r.frames, 5) + (r.vsyncBound ? '  VSYNC-BOUND' : '') + (r.truncated ? '  TRUNCATED' : ''));
+    results.ops.push({ name, perRep: +r.perRep.toFixed(5), cpuPerRep: +r.cpuPerRep.toFixed(5),
+                       net: +net.toFixed(5), reps: r.reps, frames: r.frames,
+                       vsyncBound: !!r.vsyncBound, truncated: !!r.truncated });
+    await new Promise(r2 => setTimeout(r2, 60));
+  }
+  log('');
+}
+
+// ---------------------------------------------------------------------------
+// PART 2 -- does the op demote the canvas?  Fresh canvas, geometry + op.
+// ---------------------------------------------------------------------------
+function demote(applyOp, R, frames) {
+  return new Promise(resolve => {
+    const c = mk(W, H);
+    c.c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:180px';
+    document.body.appendChild(c.c);
+    const fog = mk(W, H);
+    fog.ctx.fillStyle = '#808080'; fog.ctx.fillRect(0, 0, W, H);
+    const st = new Stats(), cpuMs = [];
+    let i = 0;
+    function step() {
+      const a = [i * 0.021 * 0.7 + 0.4, i * 0.021, i * 0.021 * 0.31, 3.1, 620];
+      R.s.build(a[0], a[1], a[2], a[3], a[4]);
+      st.reset();
+      const t0 = performance.now();
+      c.ctx.globalCompositeOperation = 'source-over';
+      c.ctx.filter = 'none';
+      c.ctx.fillStyle = BG; c.ctx.fillRect(0, 0, W, H);
+      c.ctx.lineWidth = 0.5;
+      R.setTile(2); R.batchGridExact(); R.emitBoundary(c.ctx, st, true, 2);
+      applyOp(c.ctx, fog.c);
+      cpuMs.push(+(performance.now() - t0).toFixed(2));
+      if (++i >= frames) { c.c.remove(); resolve(cpuMs); return; }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+async function part2(R) {
+  statusEl.textContent = 'part 2: demotion probes…';
+  const frames = QUICK ? 40 : 90;
+  const cases = [
+    ['no composite', (t) => { }],
+    ['multiply', (t, f) => { t.globalCompositeOperation = 'multiply'; t.drawImage(f, 0, 0); }],
+    ['lighter', (t, f) => { t.globalCompositeOperation = 'lighter'; t.drawImage(f, 0, 0); }],
+    ['difference + white rect', (t) => { t.globalCompositeOperation = 'difference'; t.fillStyle = '#fff'; t.fillRect(0, 0, W, H); }],
+    ['filter invert(1)', (t, f) => { t.filter = 'invert(1)'; t.drawImage(f, 0, 0); t.filter = 'none'; }],
+    ['getImageData 1px', (t) => { t.getImageData(0, 0, 1, 1); }]
+  ];
+  log('PART 2 -- acceleration demotion: fresh canvas, batched geometry + the op,');
+  log('         ' + frames + ' frames.  A step means the canvas went to software (3.2).');
+  log('  ' + pd('composite', 26) + rp('early', 8) + rp('late', 8) + rp('ratio', 8) + '   first 24 frames (ms)');
+  for (const [name, fn] of cases) {
+    const tr = await demote(fn, R, frames);
+    const mean = (a, i, j) => { let s = 0, n = 0; for (let k = i; k < j && k < a.length; k++) { s += a[k]; n++; } return s / n; };
+    const early = mean(tr, 4, 12), late = mean(tr, Math.max(30, frames - 50), frames);
+    log('  ' + pd(name, 26) + rp(early.toFixed(1), 8) + rp(late.toFixed(1), 8) +
+      rp((late / early).toFixed(2) + 'x', 8) + '   ' + tr.slice(0, 24).join(' '));
+    results.demote.push({ name, early: +early.toFixed(2), late: +late.toFixed(2),
+                          ratio: +(late / early).toFixed(3), trace: tr });
+    await new Promise(r2 => setTimeout(r2, 120));
+  }
+  log('');
+}
+
+// ---------------------------------------------------------------------------
+// PART 3 -- end to end.  Five architectures, and the ALGEBRA each one computes.
+//
+// target:   out = albedo * shade * (1-d)  +  fog * d
+//
+//   A  albedo, shade, depth        copy A, mul(shade), mul(depth),
+//                                  invert(depth) in place, mul(depth)
+//      = albedo*shade*d*(1-d).  This is literally the chain as usually
+//      described -- multiply the depth map, then invert/tint and multiply
+//      again -- and note it does NOT equal the target: two multiplies cannot
+//      produce an additive term.  Measured as an op-for-op stand-in, and as
+//      the reason to look at B and C.
+//   B  albedo, shade, keep, add    copy A, mul(shade), mul(keep), add(add)
+//      = albedo*shade*(1-d) + fog*d.  Correct.  Four geometry passes.
+//   C  albedo, shade*(1-d), add    copy A, mul(shadeKeep), add(add)
+//      = the same thing.  Correct, keeps the albedo/shade split, three passes.
+//      THIS is the answer to "how does fog survive the multiply": it does not
+//      -- the keep term folds into the multiply and the fog COLOUR arrives
+//      through a separate additive term.
+//   E  albedo, shade*(1-d)         copy A, mul(shadeKeep)
+//      = albedo*shade*(1-d).  Fog to BLACK only.  Correct if and only if your
+//      fog colour is black; included to show what dropping the add costs.
+//   D  folded                      one pass, no composite
+//      = albedo*shade*(1-d) + fog*d evaluated in the PALETTE.  There is no
+//      multiply left to survive.
+// ---------------------------------------------------------------------------
+const FOG_RGB = [90, 105, 130];
+function hex(r, g, b) {
+  const h = v => ('0' + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2);
+  return '#' + h(r) + h(g) + h(b);
+}
+async function part3(R, shades, matBands) {
+  statusEl.textContent = 'part 3: architectures…';
+  const vis = mk(W, H), albedo = mk(W, H), shade = mk(W, H),
+        keep = mk(W, H), add = mk(W, H), shadeKeep = mk(W, H);
+  const s = R.s, nt = s.m.nt, B = 8;
+
+  // ---- palettes, all built once ------------------------------------------
+  // the scene's own palette is (material x shade); recover the two factors so
+  // the folded palette can be built from them
+  const palRGB = s.palRGB;
+  const albedoOf = m => {                        // material base = its brightest shade
+    const i = (m * shades + (shades - 1)) * 3;
+    return [palRGB[i], palRGB[i + 1], palRGB[i + 2]];
+  };
+  const shadeOf = k => (0.14 + 0.80 * (k / Math.max(1, shades - 1)));   // scene.js's ramp
+  const dOf = b => (B <= 1 ? 0 : b / (B - 1));
+
+  const palA = [], palS = [], palK = [], palAdd = [], palSK = [], palFold = [];
+  for (let m = 0; m < matBands; m++) { const c = albedoOf(m); palA.push(hex(c[0], c[1], c[2])); }
+  for (let k = 0; k < shades; k++) { const v = shadeOf(k) * 255; palS.push(hex(v, v, v)); }
+  const palD = [];
+  for (let b = 0; b < B; b++) {
+    const d = dOf(b), v = (1 - d) * 255;
+    palK.push(hex(v, v, v));
+    palD.push(hex(d * 255, d * 255, d * 255));
+    palAdd.push(hex(FOG_RGB[0] * d, FOG_RGB[1] * d, FOG_RGB[2] * d));
+  }
+  for (let k = 0; k < shades; k++) for (let b = 0; b < B; b++) {
+    const v = shadeOf(k) * (1 - dOf(b)) * 255;
+    palSK[k * B + b] = hex(v, v, v);
+  }
+  for (let m = 0; m < matBands; m++) for (let k = 0; k < shades; k++) for (let b = 0; b < B; b++) {
+    const c = albedoOf(m), sh = shadeOf(k), d = dOf(b);
+    palFold[(m * shades + k) * B + b] = hex(
+      c[0] * sh * (1 - d) + FOG_RGB[0] * d,
+      c[1] * sh * (1 - d) + FOG_RGB[1] * d,
+      c[2] * sh * (1 - d) + FOG_RGB[2] * d);
+  }
+
+  // ---- per-frame keys ----------------------------------------------------
+  const kMat = new Int32Array(nt), kSh = new Int32Array(nt), kBand = new Int32Array(nt),
+        kShKeep = new Int32Array(nt), kFold = new Int32Array(nt);
+  const zc = new Float32Array(nt);
+  let i = 0;
+  function keys() {
+    const t0 = i++ * 0.021;
+    s.build(t0 * 0.7 + 0.4, t0, t0 * 0.31, 3.1, 620);
+    const idx = s.m.idx, sz = s.sz, n = s.nVis;
+    let zmin = Infinity, zmax = -Infinity;
+    for (let j = 0; j < n; j++) {
+      const t = s.order[j];
+      zc[t] = (sz[idx[3 * t]] + sz[idx[3 * t + 1]] + sz[idx[3 * t + 2]]) / 3;
+      if (zc[t] < zmin) zmin = zc[t];
+      if (zc[t] > zmax) zmax = zc[t];
+    }
+    const inv = 1 / Math.max(1e-6, zmax - zmin);
+    for (let j = 0; j < n; j++) {
+      const t = s.order[j], c = s.col[t];
+      let b = ((zc[t] - zmin) * inv * (B - 1) + 0.5) | 0;
+      if (b > B - 1) b = B - 1;
+      kMat[t] = (c / shades) | 0;
+      kSh[t] = c % shades;
+      kBand[t] = b;
+      kShKeep[t] = kSh[t] * B + b;
+      kFold[t] = (kMat[t] * shades + kSh[t]) * B + b;      // the CORRECT key
+    }
+  }
+  const st = new Stats();
+  // Two canvases that share a colour KEY share a batching.  Splitting batch
+  // from emit is what makes that visible: the fog keep map and the fog add map
+  // are both functions of the band alone, so a real implementation pays one
+  // batching and two emits, not two of each.
+  function batchKey(key) {
+    s.col = key;
+    R.setTile(2); R.batchGridExact();
+  }
+  function emitInto(ctx, pal, bg) {
+    const saveP = s.pal;
+    s.pal = pal;
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth = 0.5;
+    R.emitBoundary(ctx, st, true, 2);
+    s.pal = saveP;
+  }
+  function drawPass(ctx, key, pal, bg) { batchKey(key); emitInto(ctx, pal, bg); }
+  const cases = [
+    // The real shape a deferred engine ships: ONE fog pass holding `keep`, with
+    // the additive term derived from it IN PLACE by inverting and tinting.
+    // Five full-canvas ops, one of them off Firefox's accelerated list.
+    //   ctx *= keep ;  fog = 1-keep ;  fog *= tint ;  ctx += fog
+    ['A  keep + invert + tint + add (the shipped chain)', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shade.ctx, kSh, palS, '#ffffff');
+      drawPass(keep.ctx, kBand, palK, '#000000');   // black bg = full fog there
+      const v = vis.ctx, f = keep.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+      v.drawImage(keep.c, 0, 0);
+      f.globalCompositeOperation = 'difference';                  // keep -> 1-keep
+      f.fillStyle = '#ffffff'; f.fillRect(0, 0, W, H);
+      f.globalCompositeOperation = 'multiply';                    // tint it
+      f.fillStyle = hex(FOG_RGB[0], FOG_RGB[1], FOG_RGB[2]); f.fillRect(0, 0, W, H);
+      f.globalCompositeOperation = 'source-over';
+      v.globalCompositeOperation = 'lighter'; v.drawImage(keep.c, 0, 0);
+    }],
+    ['B  keep + add, 4 passes', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shade.ctx, kSh, palS, '#ffffff');
+      drawPass(keep.ctx, kBand, palK, '#ffffff');
+      drawPass(add.ctx, kBand, palAdd, '#000000');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+      v.drawImage(keep.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(add.c, 0, 0);
+    }],
+    // B with the batching shared between the two band-keyed canvases: one
+    // batching, two emits.  This is what B should have been.
+    ['B2 keep + add, ONE batch two emits', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shade.ctx, kSh, palS, '#ffffff');
+      batchKey(kBand);
+      emitInto(keep.ctx, palK, '#ffffff');
+      emitInto(add.ctx, palAdd, '#000000');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+      v.drawImage(keep.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(add.c, 0, 0);
+    }],
+    // The degenerate case, for the record: screen(out, X) = out*(1-X) + X, so
+    // a grayscale d map with `screen` IS fog-to-white exactly, in one op.
+    ['F  screen(d)  [WHITE fog only, 1 op]', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shade.ctx, kSh, palS, '#ffffff');
+      drawPass(add.ctx, kBand, palD, '#000000');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+      v.globalCompositeOperation = 'screen'; v.drawImage(add.c, 0, 0);
+    }],
+    ['C  keep folded into shade + add, 3 passes', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shadeKeep.ctx, kShKeep, palSK, '#ffffff');
+      drawPass(add.ctx, kBand, palAdd, '#000000');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shadeKeep.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(add.c, 0, 0);
+    }],
+    ['E  keep in shade, no add  [fog to BLACK only]', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shadeKeep.ctx, kShKeep, palSK, '#ffffff');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shadeKeep.c, 0, 0);
+    }],
+    ['D  folded, correct key, no composite', () => {
+      keys();
+      drawPass(vis.ctx, kFold, palFold, BG);
+    }],
+    ['(no fog: albedo x shade only)', () => {
+      keys();
+      drawPass(albedo.ctx, kMat, palA, BG);
+      drawPass(shade.ctx, kSh, palS, '#ffffff');
+      const v = vis.ctx;
+      v.globalCompositeOperation = 'copy'; v.drawImage(albedo.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+    }]
+  ];
+  log('PART 3 -- end to end, ' + B + ' fog bands, correct colour keys');
+  log('  ' + pd('architecture', 44) + rp('frameMs', 9) + rp('cpuMs', 9) +
+    rp('fills', 8) + rp('verts', 9));
+  for (const [name, fn] of cases) {
+    st.reset();
+    fn();                                   // one warm call to fill the Stats
+    const fills = st.fills, verts = st.verts;
+    const r = await sustained(fn, 1, QUICK ? 40 : 90, 8000);
+    log('  ' + pd(name, 44) + rp(r.perFrame.toFixed(2), 9) + rp(r.cpu.toFixed(2), 9) +
+      rp(fills, 8) + rp(verts, 9));
+    results.arch.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                        fills, verts });
+    await new Promise(z => setTimeout(z, 80));
+  }
+  log('');
+}
+
+// ---------------------------------------------------------------------------
+(async function () {
+  // single-instance lease (2): two concurrent pages destroy every number
+  try {
+    const g = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json());
+    if (!g.granted) { statusEl.textContent = 'another instance holds the lease; idling'; return; }
+  } catch (e) { }
+  setInterval(() => { fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }); }, 5000);
+
+  const shades = 24, matBands = 8;
+  const mesh = makeTorusKnot(QUICK ? 256 : 512, QUICK ? 32 : 64, 3, 7, matBands);
+  const scene = new Scene(mesh, W, H, shades, matBands);
+  scene.build(0.4, 0.9, 0.13, 3.1, 620);
+  const R = new Renderer(scene, 2);
+  log('fog benchmark -- ' + TAG + '   torus knot, ' + scene.nVis + ' visible, ' + W + 'x' + H);
+  log('');
+  try {
+    await part1();
+    await part2(R);
+    await part3(R, shades, matBands);
+  } catch (e) {
+    log('ERROR: ' + (e && e.stack || e));
+    results.error = String(e);
+  }
+  results.micro = [{ note: 'fog page complete', ops: results.ops.length,
+                     demote: results.demote.length, arch: results.arch.length }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(results)
+  }).catch(() => { });
+})();
+</script>

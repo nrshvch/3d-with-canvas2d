@@ -1,0 +1,1060 @@
+<meta charset="utf-8">
+<title>isolation, invert idioms, no-clear, slot count</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+  #stack { position:relative; width:640px; height:360px; margin:8px 0; }
+  #stack canvas { position:absolute; left:0; top:0; width:640px; height:360px; }
+</style>
+<div id="status">booting…</div>
+<div id="stack"></div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// FIVE QUESTIONS, all of them raised by shipping an engine rather than by
+// reading the source.  Each part says what would falsify it.
+//
+// P1  IS DEMOTION PER-CANVAS, AND IS IT PERMANENT?
+//     Gecko's UsageProfile is a member of DrawTargetWebgl (per canvas) and
+//     mAllowAcceleration is a member of CanvasRenderingContext2D (per canvas
+//     element), set false and never set back.  So the prediction is: an
+//     unsupported op poisons ONLY the canvas it runs on, forever -- and every
+//     GEOMETRY draw on that canvas afterwards pays software rasterisation.
+//     Moving the op to a scratch canvas should leave the geometry canvas
+//     accelerated.  Needs a workload that would otherwise STAY accelerated,
+//     i.e. one whose paths repeat and therefore hit the path cache: animated
+//     geometry demotes itself and hides the effect (that was the old mistake).
+//
+// P2  WHICH INVERT IDIOM, AND DOES THE ANSWER DEPEND ON THE SCENE?
+//     difference+white rect against ctx.filter=invert(), on a simple and a
+//     complex scene, measured GPU-inclusive.  A ranking that flips with scene
+//     size is the thing to catch.
+//
+// P3  CAN FOG PAY FOR THE CLEARS?  Skipping the per-frame clear of the fill
+//     and shade passes is only legal where the fog term reaches full density.
+//     Measure what it saves AND where the two images differ.
+//
+// P4  WHAT DOES THE OPEN-SLOT COUNT COST?  batchLookback(K) is the "K open
+//     batches waiting for an adjacent face" model.  Sweep K and report CPU
+//     and presented-frame time SEPARATELY, because they disagree.
+//
+// P5  CSS-STACKED CANVASES instead of a canvas2d composite.  Compositor work
+//     never appears in performance.now(), so this one is measured as presented
+//     frame interval only.
+//
+// ACCELERATION VERDICT, not inferred from timing:
+//   gfx.canvas.accelerated.debug=true makes Gecko draw a 16x16 green rect in
+//   the top-right corner of every canvas that is still accelerated, in
+//   DrawTargetWebgl::EndFrame.  We read that corner through a separate
+//   software canvas AFTER a case finishes, so the probe cannot perturb it.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'iso';
+const QUICK = Q.get('quick') === '1';
+const PARTS = (Q.get('parts') || '6,7,8,1,2,3,4,5').split(',');
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const results = { tag: TAG, micro: [], env: {}, contagion: [], invert: [], noclear: [],
+                  slots: [], cssStack: [], keepAccel: [], cliff: [], shared: [] };
+
+function mk(w, h, opts) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return { c, ctx: c.getContext('2d', opts || { alpha: false }) };
+}
+function attach(t) {
+  t.c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:180px';
+  document.body.appendChild(t.c);
+  return t;
+}
+
+// --- acceleration indicator ------------------------------------------------
+let probe = null;
+function accelFraction(canvas) {
+  if (!probe) probe = mk(32, 32, { alpha: false, willReadFrequently: true });
+  const p = probe.ctx;
+  p.globalCompositeOperation = 'source-over'; p.filter = 'none';
+  p.fillStyle = '#000'; p.fillRect(0, 0, 32, 32);
+  p.drawImage(canvas, canvas.width - 16, 0, 16, 16, 0, 0, 16, 16);
+  const d = p.getImageData(3, 3, 10, 10).data;
+  let green = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    n++;
+    if (d[i] < 60 && d[i + 1] > 190 && d[i + 2] < 60) green++;
+  }
+  return green / n;
+}
+let INDICATOR = false;                      // is gfx.canvas.accelerated.debug on?
+function verdict(canvas) {
+  if (!INDICATOR) return '-';
+  return accelFraction(canvas) > 0.8 ? 'ACCEL' : 'soft';
+}
+function nextFrame() { return new Promise(r => requestAnimationFrame(r)); }
+
+// --- sustained, GPU-inclusive ----------------------------------------------
+// total wall / frames.  performance.now() around canvas calls measures display
+// list recording, not rasterisation, so every ranking in this file that could
+// be decided by GPU time is decided on this number instead.
+const MINF = 8;
+function sustained(fn, frames, budgetMs) {
+  budgetMs = budgetMs || 6000;
+  return new Promise(resolve => {
+    let t0 = 0, warm = 4;
+    const cpu = [], iv = [];
+    let last = -1;
+    const wall0 = performance.now();
+    function step(ts) {
+      if (warm > 0) { warm--; fn(); if (warm === 0) { t0 = ts; last = ts; } requestAnimationFrame(step); return; }
+      if (last >= 0) iv.push(ts - last);
+      last = ts;
+      const c0 = performance.now();
+      fn();
+      cpu.push(performance.now() - c0);
+      const spent = performance.now() - wall0;
+      if (cpu.length >= frames || (cpu.length >= MINF && spent > budgetMs)) {
+        let s = 0; for (const v of cpu) s += v;
+        const wall = (performance.now() - t0) / cpu.length;
+        resolve({ perFrame: wall, cpu: s / cpu.length, frames: cpu.length,
+                  truncated: cpu.length < frames, iv });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+// ===========================================================================
+// scenes
+// ===========================================================================
+const FOG_RGB = [90, 105, 130];
+function hex(r, g, b) {
+  const h = v => ('0' + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2);
+  return '#' + h(r) + h(g) + h(b);
+}
+const SHADES = 24, MATS = 8, B = 8;
+
+function makeWorld(segs, sides) {
+  const mesh = makeTorusKnot(segs, sides, 3, 7, MATS);
+  const s = new Scene(mesh, W, H, SHADES, MATS);
+  s.build(0.4, 0.9, 0.13, 3.1, 620);
+  const R = new Renderer(s, 2);
+  const nt = mesh.nt;
+  return {
+    mesh, s, R, nt,
+    // Scene.build() writes the palette index into s.col, and every pass
+    // temporarily points s.col at one of the key arrays.  Hold on to the
+    // original so keys() always derives from the palette index and never from
+    // whatever the last pass left aliased there -- otherwise the key arrays
+    // silently collapse to one colour and the batcher merges the whole mesh.
+    baseCol: s.col,
+    kMat: new Int32Array(nt), kSh: new Int32Array(nt), kBand: new Int32Array(nt),
+    zc: new Float32Array(nt), frame: 0
+  };
+}
+// palettes are shared: they only depend on the palette layout, not the mesh
+const palA = [], palS = [], palKeep = [], palAdd = [], palD = [];
+(function () {
+  for (let m = 0; m < MATS; m++) palA.push('#' + ((1 << 24) + (((m * 29 + 40) & 255) << 16) +
+    (((m * 71 + 30) & 255) << 8) + ((m * 113 + 60) & 255)).toString(16).slice(1));
+  for (let k = 0; k < SHADES; k++) { const v = (0.14 + 0.80 * k / (SHADES - 1)) * 255; palS.push(hex(v, v, v)); }
+  for (let b = 0; b < B; b++) {
+    const d = b / (B - 1), v = (1 - d) * 255;
+    palKeep.push(hex(v, v, v));
+    palD.push(hex(d * 255, d * 255, d * 255));
+    palAdd.push(hex(FOG_RGB[0] * d, FOG_RGB[1] * d, FOG_RGB[2] * d));
+  }
+})();
+
+function keys(w, animate) {
+  w.s.col = w.baseCol;                       // see makeWorld
+  if (animate) {
+    const t = w.frame++ * 0.021;
+    w.s.build(t * 0.7 + 0.4, t, t * 0.31, 3.1, 620);
+  }
+  const s = w.s, idx = s.m.idx, sz = s.sz, n = s.nVis, zc = w.zc;
+  let zmin = Infinity, zmax = -Infinity;
+  for (let j = 0; j < n; j++) {
+    const t = s.order[j];
+    zc[t] = (sz[idx[3 * t]] + sz[idx[3 * t + 1]] + sz[idx[3 * t + 2]]) / 3;
+    if (zc[t] < zmin) zmin = zc[t];
+    if (zc[t] > zmax) zmax = zc[t];
+  }
+  const inv = 1 / Math.max(1e-6, zmax - zmin);
+  for (let j = 0; j < n; j++) {
+    const t = s.order[j], c = s.col[t];
+    let b = ((zc[t] - zmin) * inv * (B - 1) + 0.5) | 0;
+    if (b > B - 1) b = B - 1;
+    w.kMat[t] = (c / SHADES) | 0;
+    w.kSh[t] = c % SHADES;
+    w.kBand[t] = b;
+  }
+}
+const ST = new Stats();
+function batchKey(w, key) { w.s.col = key; w.R.setTile(2); w.R.batchGridExact(); }
+function emitInto(w, ctx, pal, bg) {
+  const save = w.s.pal;
+  w.s.pal = pal;
+  ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+  if (bg !== null) { ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H); }
+  ctx.lineWidth = 0.5;
+  w.R.emitBoundary(ctx, ST, true, 2);
+  w.s.pal = save;
+}
+function drawPass(w, ctx, key, pal, bg) { batchKey(w, key); emitInto(w, ctx, pal, bg); }
+
+// ===========================================================================
+// P1 -- is the demotion per-canvas, and is it permanent?
+// ===========================================================================
+// The workload has to be one that would OTHERWISE STAY ACCELERATED, so the
+// static variant never rebuilds the scene: identical paths every frame hit
+// Gecko's path cache (DrawWGRPath -> OnCacheHit) and the frame passes the
+// usage profile.  The animated variant is the control that shows the effect
+// disappearing, because novel paths demote the canvas on their own.
+function contagion(name, w, animate, frames, mode) {
+  return new Promise(resolve => {
+    const tgt = attach(mk(W, H));
+    const scratch = attach(mk(W, H));
+    const geo = [], op = [];
+    let i = 0;
+    if (!animate) keys(w, false);            // build ONCE: paths repeat exactly
+    function step() {
+      if (animate) keys(w, true);
+      const t0 = performance.now();
+      // --- the geometry.  This is the number that matters: what does drawing
+      //     faces cost on this canvas, given what else has happened to it?
+      const c = tgt.ctx;
+      c.globalCompositeOperation = 'source-over'; c.filter = 'none';
+      drawPass(w, c, w.kMat, palA, BG);
+      const t1 = performance.now();
+      // --- the op
+      const doOp = mode === 'same' || (mode === 'stop' && i < 20) ||
+                   (mode === 'reset' && i < 30);
+      if (doOp) {
+        c.globalCompositeOperation = 'difference';
+        c.fillStyle = '#ffffff'; c.fillRect(0, 0, W, H);
+        c.globalCompositeOperation = 'source-over';
+      } else if (mode === 'isolated') {
+        // the same algebra, but the unsupported op happens on a canvas that
+        // draws no geometry and is then composited back with an accepted op
+        const f = scratch.ctx;
+        f.globalCompositeOperation = 'source-over'; f.filter = 'none';
+        f.fillStyle = '#808080'; f.fillRect(0, 0, W, H);
+        f.globalCompositeOperation = 'difference';
+        f.fillStyle = '#ffffff'; f.fillRect(0, 0, W, H);
+        f.globalCompositeOperation = 'source-over';
+        c.globalCompositeOperation = 'multiply';
+        c.drawImage(scratch.c, 0, 0);
+        c.globalCompositeOperation = 'source-over';
+      }
+      if (mode === 'reset' && i === 30) { tgt.c.width = W; tgt.c.height = H; }
+      const t2 = performance.now();
+      geo.push(+(t1 - t0).toFixed(2));
+      op.push(+(t2 - t1).toFixed(2));
+      if (++i >= frames) {
+        requestAnimationFrame(() => {
+          const v = verdict(tgt.c), vs = verdict(scratch.c);
+          tgt.c.remove(); scratch.c.remove();
+          resolve({ name, animate, mode, geo, op, verdict: v, scratchVerdict: vs });
+        });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+const mean = (a, i, j) => { let s = 0, n = 0; for (let k = i; k < j && k < a.length; k++) { s += a[k]; n++; } return n ? s / n : NaN; };
+
+async function part1(world) {
+  statusEl.textContent = 'P1 contagion…';
+  const frames = QUICK ? 45 : 90;
+  log('P1 -- does an unsupported op poison the canvas it runs on, and only it?');
+  log('     geometry sub-timer only (the op is timed separately).  ' +
+      world.s.nVis + ' visible faces, redrawn' );
+  log('     STATIC = identical paths every frame, so the path cache hits and the');
+  log('     canvas would stay accelerated if nothing else demoted it.');
+  log('  ' + pd('workload / arrangement', 40) + rp('geoEarly', 9) + rp('geoLate', 9) +
+      rp('step', 7) + rp('op ms', 8) + rp('accel', 7) + rp('scratch', 8));
+  const cases = [
+    ['static: geometry only', false, 'none'],
+    ['static: + difference, SAME canvas', false, 'same'],
+    ['static: + difference, SCRATCH canvas', false, 'isolated'],
+    ['static: difference for 20 frames only', false, 'stop'],
+    ['static: difference, then canvas.width reset', false, 'reset'],
+    ['animated: geometry only', true, 'none'],
+    ['animated: + difference, SAME canvas', true, 'same'],
+    ['animated: + difference, SCRATCH canvas', true, 'isolated']
+  ];
+  for (const [name, animate, mode] of cases) {
+    statusEl.textContent = 'P1 ' + name;
+    const r = await contagion(name, world, animate, frames, mode);
+    const e = mean(r.geo, 3, 10), l = mean(r.geo, frames - 30, frames);
+    const opMs = mean(r.op, 3, frames);
+    log('  ' + pd(name, 40) + rp(e.toFixed(2), 9) + rp(l.toFixed(2), 9) +
+        rp((l / e).toFixed(2) + 'x', 7) + rp(opMs.toFixed(2), 8) +
+        rp(r.verdict, 7) + rp(r.scratchVerdict, 8));
+    results.contagion.push({ name, animate, mode, early: +e.toFixed(3), late: +l.toFixed(3),
+      step: +(l / e).toFixed(3), opMs: +opMs.toFixed(3), verdict: r.verdict,
+      scratchVerdict: r.scratchVerdict, geo: r.geo });
+    await new Promise(z => setTimeout(z, 120));
+  }
+  log('');
+}
+
+// ===========================================================================
+// P2 -- invert idioms, simple scene against complex
+// ===========================================================================
+// Every case computes the same thing: a fog ADD map derived from a fog KEEP
+// map.  What differs is how the inversion is expressed.  The whole frame is
+// measured, not the op, because that is the decision being made.
+async function part2(worlds) {
+  statusEl.textContent = 'P2 invert idioms…';
+  const albedo = mk(W, H), shade = mk(W, H), keep = mk(W, H), vis = attach(mk(W, H));
+  const tmp = mk(W, H);
+  const tint = hex(FOG_RGB[0], FOG_RGB[1], FOG_RGB[2]);
+  function chain(w, invert) {
+    keys(w, true);
+    drawPass(w, albedo.ctx, w.kMat, palA, BG);
+    drawPass(w, shade.ctx, w.kSh, palS, '#ffffff');
+    drawPass(w, keep.ctx, w.kBand, palKeep, '#000000');
+    const v = vis.ctx, f = keep.ctx;
+    v.globalCompositeOperation = 'copy'; v.filter = 'none'; v.drawImage(albedo.c, 0, 0);
+    v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+    v.drawImage(keep.c, 0, 0);
+    invert(f);
+    f.globalCompositeOperation = 'multiply'; f.filter = 'none';
+    f.fillStyle = tint; f.fillRect(0, 0, W, H);
+    f.globalCompositeOperation = 'source-over';
+    v.globalCompositeOperation = 'lighter'; v.drawImage(keep.c, 0, 0);
+    v.globalCompositeOperation = 'source-over';
+  }
+  const idioms = [
+    ['difference + white rect', f => {
+      f.globalCompositeOperation = 'difference'; f.filter = 'none';
+      f.fillStyle = '#ffffff'; f.fillRect(0, 0, W, H);
+    }],
+    ['filter invert(1) + self drawImage', f => {
+      f.globalCompositeOperation = 'source-over';
+      f.filter = 'invert(1)'; f.drawImage(f.canvas, 0, 0); f.filter = 'none';
+    }],
+    ['filter invert(1) + drawImage of a copy', f => {
+      tmp.ctx.globalCompositeOperation = 'copy'; tmp.ctx.filter = 'none';
+      tmp.ctx.drawImage(f.canvas, 0, 0);
+      f.globalCompositeOperation = 'copy';
+      f.filter = 'invert(1)'; f.drawImage(tmp.c, 0, 0); f.filter = 'none';
+      f.globalCompositeOperation = 'source-over';
+    }],
+    // invert(0) is the IDENTITY filter.  It computes nothing, so whatever it
+    // costs is the price of the filter machinery alone -- the number that says
+    // whether "use a cheaper filter amount" is even a lever.
+    ['filter invert(0) + self drawImage  [identity]', f => {
+      f.globalCompositeOperation = 'source-over';
+      f.filter = 'invert(0)'; f.drawImage(f.canvas, 0, 0); f.filter = 'none';
+    }]
+  ];
+  log('P2 -- how to invert a fog map, on two scene sizes.  Whole frame, GPU-inclusive.');
+  log('     `fog accel` is the state of the canvas the invert runs on, which is the');
+  log('     variable that decides whether the idiom is cheap or catastrophic.');
+  log('  ' + pd('idiom', 46) + rp('simple', 10) + rp('cpu', 9) + rp('accel', 7) +
+      rp('complex', 10) + rp('cpu', 9) + rp('accel', 7) + rp('cplx/simple', 12));
+  for (const [name, inv] of idioms) {
+    const row = { name };
+    for (const [tag, w] of worlds) {
+      statusEl.textContent = 'P2 ' + name + ' / ' + tag;
+      // a FRESH fog canvas per case, so a demotion caused by the previous
+      // idiom cannot be charged to this one
+      const fresh = mk(W, H);
+      keep.c = fresh.c; keep.ctx = fresh.ctx;
+      const fn = () => chain(w, inv);
+      fn();
+      const r = await sustained(fn, QUICK ? 25 : 60, 8000);
+      row[tag] = +r.perFrame.toFixed(2); row[tag + 'Cpu'] = +r.cpu.toFixed(2);
+      row[tag + 'Accel'] = verdict(keep.c);
+      await new Promise(z => setTimeout(z, 80));
+    }
+    log('  ' + pd(name, 46) + rp(row.simple.toFixed(2), 10) + rp(row.simpleCpu.toFixed(2), 9) +
+        rp(row.simpleAccel, 7) +
+        rp(row.complex.toFixed(2), 10) + rp(row.complexCpu.toFixed(2), 9) +
+        rp(row.complexAccel, 7) +
+        rp((row.complex / row.simple).toFixed(1) + 'x', 12));
+    results.invert.push(row);
+  }
+  // the baseline that needs no invert at all: emit the add map straight from
+  // the palette, one extra emit sharing the band batching
+  {
+    const add = mk(W, H);
+    const row = { name: 'no invert: add map from the palette (B2)' };
+    for (const [tag, w] of worlds) {
+      statusEl.textContent = 'P2 palette / ' + tag;
+      const fresh = mk(W, H);
+      keep.c = fresh.c; keep.ctx = fresh.ctx;
+      const fn = () => {
+        keys(w, true);
+        drawPass(w, albedo.ctx, w.kMat, palA, BG);
+        drawPass(w, shade.ctx, w.kSh, palS, '#ffffff');
+        batchKey(w, w.kBand);
+        emitInto(w, keep.ctx, palKeep, '#ffffff');
+        emitInto(w, add.ctx, palAdd, '#000000');
+        const v = vis.ctx;
+        v.globalCompositeOperation = 'copy'; v.filter = 'none'; v.drawImage(albedo.c, 0, 0);
+        v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+        v.drawImage(keep.c, 0, 0);
+        v.globalCompositeOperation = 'lighter'; v.drawImage(add.c, 0, 0);
+        v.globalCompositeOperation = 'source-over';
+      };
+      fn();
+      const r = await sustained(fn, QUICK ? 25 : 60, 8000);
+      row[tag] = +r.perFrame.toFixed(2); row[tag + 'Cpu'] = +r.cpu.toFixed(2);
+      row[tag + 'Accel'] = verdict(keep.c);
+      await new Promise(z => setTimeout(z, 80));
+    }
+    log('  ' + pd(row.name, 46) + rp(row.simple.toFixed(2), 10) + rp(row.simpleCpu.toFixed(2), 9) +
+        rp(row.simpleAccel, 7) +
+        rp(row.complex.toFixed(2), 10) + rp(row.complexCpu.toFixed(2), 9) +
+        rp(row.complexAccel, 7) +
+        rp((row.complex / row.simple).toFixed(1) + 'x', 12));
+    results.invert.push(row);
+  }
+  vis.c.remove();
+  log('');
+}
+
+// ===========================================================================
+// P3 -- can the fog pay for the clears?
+// ===========================================================================
+// out = albedo*shade*(1-d) + fog*d.  Where d = 1 the first term vanishes, so
+// whatever stale content the albedo and shade canvases still hold is
+// multiplied by zero.  That is the whole argument, and it is exact -- but only
+// where d reaches 1.  So: measure what the clears cost, and measure where the
+// two images actually differ.
+async function part3(w) {
+  statusEl.textContent = 'P3 no-clear...';
+  const albedo = mk(W, H), shade = mk(W, H), keep = mk(W, H), add = mk(W, H),
+        vis = attach(mk(W, H));
+  // The backgrounds are what make the trick legal, so they are spelled out.
+  // keep = black  -> (1-d) = 0 where there is no geometry, which multiplies
+  //                  whatever stale content the fill pass still holds by zero.
+  // add  = the full fog colour, so the background comes out as fog, which is
+  //        also the physically right answer for an infinitely distant pixel.
+  const ADD_BG = hex(FOG_RGB[0], FOG_RGB[1], FOG_RGB[2]);
+  function frame(clearPasses, fog) {
+    keys(w, true);
+    drawPass(w, albedo.ctx, w.kMat, palA, clearPasses ? BG : null);
+    drawPass(w, shade.ctx, w.kSh, palS, clearPasses ? '#ffffff' : null);
+    const v = vis.ctx;
+    v.globalCompositeOperation = 'copy'; v.filter = 'none'; v.drawImage(albedo.c, 0, 0);
+    v.globalCompositeOperation = 'multiply'; v.drawImage(shade.c, 0, 0);
+    if (fog) {
+      batchKey(w, w.kBand);
+      emitInto(w, keep.ctx, palKeep, '#000000');
+      emitInto(w, add.ctx, palAdd, ADD_BG);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(keep.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(add.c, 0, 0);
+    }
+    v.globalCompositeOperation = 'source-over';
+  }
+  log('P3 -- skipping the clear on the fill and shade passes');
+  log('  ' + pd('variant', 40) + rp('frameMs', 10) + rp('cpuMs', 9) + rp('accel', 7));
+  const cases = [
+    ['fog, clear both passes', () => frame(true, true)],
+    ['fog, clear NEITHER', () => frame(false, true)],
+    ['no fog, clear both passes', () => frame(true, false)],
+    ['no fog, clear NEITHER', () => frame(false, false)]
+  ];
+  for (const [name, fn] of cases) {
+    statusEl.textContent = 'P3 ' + name;
+    // start from a clean slate so a case cannot inherit the previous case's
+    // stale pixels
+    albedo.ctx.globalCompositeOperation = 'source-over'; albedo.ctx.filter = 'none';
+    albedo.ctx.fillStyle = BG; albedo.ctx.fillRect(0, 0, W, H);
+    shade.ctx.globalCompositeOperation = 'source-over'; shade.ctx.filter = 'none';
+    shade.ctx.fillStyle = '#ffffff'; shade.ctx.fillRect(0, 0, W, H);
+    fn();
+    const r = await sustained(fn, QUICK ? 25 : 60, 8000);
+    log('  ' + pd(name, 40) + rp(r.perFrame.toFixed(2), 10) + rp(r.cpu.toFixed(2), 9) +
+        rp(verdict(vis.c), 7));
+    results.noclear.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                           verdict: verdict(vis.c) });
+    await new Promise(z => setTimeout(z, 80));
+  }
+
+  // --- what does ONE full-canvas clear actually cost, on its own? ----------
+  // The four rows above differ by exactly two fillRects, so if they differ by
+  // more than two fillRects are worth, the clear is not what is being measured.
+  {
+    const one = attach(mk(W, H));
+    for (const [name, doClear] of [['one pass, with its clear', true], ['one pass, no clear', false]]) {
+      const fn = () => {
+        keys(w, true);
+        drawPass(w, one.ctx, w.kMat, palA, doClear ? BG : null);
+      };
+      one.ctx.globalCompositeOperation = 'source-over'; one.ctx.filter = 'none';
+      one.ctx.fillStyle = BG; one.ctx.fillRect(0, 0, W, H);
+      fn();
+      const r = await sustained(fn, QUICK ? 25 : 55, 8000);
+      log('  ' + pd(name, 40) + rp(r.perFrame.toFixed(2), 10) + rp(r.cpu.toFixed(2), 9) +
+          rp(verdict(one.c), 7));
+      results.noclear.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                             verdict: verdict(one.c) });
+      await new Promise(z => setTimeout(z, 80));
+    }
+    one.c.remove();
+  }
+
+  // --- correctness: same camera, cleared against not-cleared --------------
+  const ref = mk(W, H, { alpha: false, willReadFrequently: true });
+  function grab() {
+    ref.ctx.globalCompositeOperation = 'copy'; ref.ctx.filter = 'none';
+    ref.ctx.drawImage(vis.c, 0, 0);
+    return ref.ctx.getImageData(0, 0, W, H).data;
+  }
+  function compare(a, b) {
+    let n = 0, g8 = 0, g16 = 0, maxd = 0, sq = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      const d0 = Math.abs(a[i] - b[i]), d1 = Math.abs(a[i + 1] - b[i + 1]), d2 = Math.abs(a[i + 2] - b[i + 2]);
+      const d = d0 > d1 ? (d0 > d2 ? d0 : d2) : (d1 > d2 ? d1 : d2);
+      if (d > 0) n++;
+      if (d > 8) g8++;
+      if (d > 16) g16++;
+      if (d > maxd) maxd = d;
+      sq += d * d;
+    }
+    const tot = W * H;
+    return { anyPct: +(100 * n / tot).toFixed(3), gt8Pct: +(100 * g8 / tot).toFixed(3),
+             gt16Pct: +(100 * g16 / tot).toFixed(3), maxDelta: maxd,
+             rmse: +Math.sqrt(sq / tot).toFixed(3) };
+  }
+  for (const fog of [true, false]) {
+    const save = w.frame;
+    // leave a DIFFERENT camera's frame behind in the two passes
+    w.frame = 900; frame(true, fog);
+    w.frame = save; frame(false, fog);
+    const dirty = grab();
+    w.frame = save; frame(true, fog);
+    const clean = grab();
+    const c = compare(clean, dirty);
+    log('  stale pixels visible, ' + (fog ? 'WITH fog' : 'without fog') + ':  any=' +
+        c.anyPct + '%  >8/255=' + c.gt8Pct + '%  >16/255=' + c.gt16Pct + '%  max=' +
+        c.maxDelta + '  rmse=' + c.rmse);
+    results.noclear.push({ name: 'stale delta ' + (fog ? 'with fog' : 'no fog'), cmp: c });
+  }
+  vis.c.remove();
+
+  // --- does redrawing without clearing improve the seams? ------------------
+  // Every redraw of the same opaque face composites its antialiased coverage
+  // again, so a shared-edge pixel converges geometrically towards the face
+  // colour and away from whatever was behind it.  Whether that is an
+  // IMPROVEMENT is a question about ground truth, so it is measured against a
+  // 4x supersampled render of the same frame.
+  await seamAccumulation(w);
+  log('');
+}
+
+// 4x supersampled reference at a reduced size, so the 16x buffer stays sane
+async function seamAccumulation(w) {
+  const SW = 640, SH = 360, SS = 4;
+  const mesh = w.mesh;
+  const s2 = new Scene(mesh, SW, SH, SHADES, MATS);
+  const R2 = new Renderer(s2, 2);
+  const w2 = { mesh, s: s2, R: R2, nt: w.nt, baseCol: s2.col,
+               kMat: new Int32Array(w.nt),
+               kSh: new Int32Array(w.nt), kBand: new Int32Array(w.nt),
+               zc: new Float32Array(w.nt), frame: 40 };
+  s2.build(40 * 0.021 * 0.7 + 0.4, 40 * 0.021, 40 * 0.021 * 0.31, 3.1, 310);
+  keys(w2, false);
+  const st = new Stats();
+  function draw(ctx, scale, bg) {
+    const savePal = s2.pal, saveCol = s2.col;
+    s2.col = w2.kMat; s2.pal = palA;
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    if (bg !== null) { ctx.fillStyle = bg; ctx.fillRect(0, 0, SW, SH); }
+    ctx.lineWidth = 0.5;
+    R2.setTile(2); R2.batchGridExact(); st.reset(); R2.emitBoundary(ctx, st, true, 2);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    s2.pal = savePal; s2.col = saveCol;
+  }
+  const big = mk(SW * SS, SH * SS, { alpha: false, willReadFrequently: true });
+  draw(big.ctx, SS, BG);
+  const src = big.ctx.getImageData(0, 0, SW * SS, SH * SS).data;
+  const gt = new Uint8ClampedArray(SW * SH * 4);
+  const inv = 1 / (SS * SS), rw = SW * SS;
+  for (let y = 0; y < SH; y++) {
+    for (let x = 0; x < SW; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        let o = ((y * SS + sy) * rw + x * SS) * 4;
+        for (let sx = 0; sx < SS; sx++) { r += src[o]; g += src[o + 1]; b += src[o + 2]; o += 4; }
+      }
+      const d = (y * SW + x) * 4;
+      gt[d] = r * inv; gt[d + 1] = g * inv; gt[d + 2] = b * inv; gt[d + 3] = 255;
+    }
+  }
+  big.c.width = big.c.height = 1;
+  const tgt = mk(SW, SH, { alpha: false, willReadFrequently: true });
+  log('  repeated redraw without clearing, against a 4x supersampled reference');
+  log('  ' + pd('redraws of the same frame', 30) + rp('rmse', 8) + rp('mae', 8) +
+      rp('>8/255 %', 10));
+  const marks = [1, 2, 4, 8, 16, 32];
+  tgt.ctx.fillStyle = BG; tgt.ctx.fillRect(0, 0, SW, SH);
+  let k = 0;
+  for (const m of marks) {
+    while (k < m) { draw(tgt.ctx, 1, k === 0 ? BG : null); k++; }
+    const d = tgt.ctx.getImageData(0, 0, SW, SH).data;
+    let sq = 0, sum = 0, g8 = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      const a0 = Math.abs(gt[i] - d[i]), a1 = Math.abs(gt[i + 1] - d[i + 1]), a2 = Math.abs(gt[i + 2] - d[i + 2]);
+      const dd = a0 > a1 ? (a0 > a2 ? a0 : a2) : (a1 > a2 ? a1 : a2);
+      sq += dd * dd; sum += dd; if (dd > 8) g8++;
+    }
+    const tot = SW * SH;
+    const row = { name: 'seam accumulation', redraws: m, rmse: +Math.sqrt(sq / tot).toFixed(3),
+                  mae: +(sum / tot).toFixed(3), gt8Pct: +(100 * g8 / tot).toFixed(3) };
+    log('  ' + pd(String(m), 30) + rp(row.rmse, 8) + rp(row.mae, 8) + rp(row.gt8Pct, 10));
+    results.noclear.push(row);
+    await nextFrame();
+  }
+}
+
+// ===========================================================================
+// P4 -- open slot count
+// ===========================================================================
+// batchLookback(K) keeps K batches open and joins a face to the newest open
+// batch of its colour, stopping at the first batch whose bbox blocks it.  That
+// is the "how many slots wait for an adjacent face" knob, and the point of the
+// measurement is that CPU time and presented frame time move in OPPOSITE
+// directions across it.
+async function part4(w) {
+  statusEl.textContent = 'P4 slot sweep…';
+  const tgt = attach(mk(W, H));
+  log('P4 -- open batch slots (batchLookback K).  Note which column ranks them.');
+  log('  ' + pd('K', 10) + rp('fills', 8) + rp('verts', 9) + rp('maxPath', 9) +
+      rp('cpuMs', 9) + rp('frameMs', 10) + rp('accel', 7));
+  const Ks = QUICK ? [1, 8, 64, 1024] : [1, 2, 4, 8, 16, 32, 64, 128, 512, 4096];
+  for (const K of Ks) {
+    statusEl.textContent = 'P4 K=' + K;
+    const fn = () => {
+      keys(w, true);
+      const c = tgt.ctx;
+      c.globalCompositeOperation = 'source-over'; c.filter = 'none';
+      c.fillStyle = BG; c.fillRect(0, 0, W, H);
+      c.lineWidth = 0.5;
+      w.s.col = w.kMat; w.s.pal = palA;
+      w.R.batchLookback(K);
+      w.R.emitBoundary(c, ST, true, 2);
+    };
+    ST.reset(); fn();
+    const fills = ST.fills, verts = ST.verts, maxV = ST.maxFillVerts;
+    const r = await sustained(fn, QUICK ? 25 : 55, 8000);
+    const v = verdict(tgt.c);
+    log('  ' + pd(String(K), 10) + rp(fills, 8) + rp(verts, 9) + rp(maxV, 9) +
+        rp(r.cpu.toFixed(2), 9) + rp(r.perFrame.toFixed(2), 10) + rp(v, 7));
+    results.slots.push({ K, fills, verts, maxFillVerts: maxV,
+                         cpuMs: +r.cpu.toFixed(3), frameMs: +r.perFrame.toFixed(3), verdict: v });
+    await new Promise(z => setTimeout(z, 80));
+  }
+  // the grid batcher, for scale
+  {
+    const fn = () => {
+      keys(w, true);
+      const c = tgt.ctx;
+      c.globalCompositeOperation = 'source-over'; c.filter = 'none';
+      c.fillStyle = BG; c.fillRect(0, 0, W, H);
+      c.lineWidth = 0.5;
+      drawPass(w, c, w.kMat, palA, null);
+    };
+    ST.reset(); fn();
+    const fills = ST.fills, verts = ST.verts, maxV = ST.maxFillVerts;
+    const r = await sustained(fn, QUICK ? 25 : 55, 8000);
+    log('  ' + pd('gridExact', 10) + rp(fills, 8) + rp(verts, 9) + rp(maxV, 9) +
+        rp(r.cpu.toFixed(2), 9) + rp(r.perFrame.toFixed(2), 10) + rp(verdict(tgt.c), 7));
+    results.slots.push({ K: 'gridExact', fills, verts, maxFillVerts: maxV,
+                         cpuMs: +r.cpu.toFixed(3), frameMs: +r.perFrame.toFixed(3) });
+  }
+  tgt.c.remove();
+  log('');
+}
+
+// ===========================================================================
+// P5 -- CSS-stacked canvases instead of a canvas2d composite
+// ===========================================================================
+// The compositor's work never shows up in performance.now(), so the only
+// honest number is the presented frame interval.  Both arrangements draw the
+// same geometry into the same number of canvases; only the blend moves.
+async function part5(w) {
+  statusEl.textContent = 'P5 CSS stack…';
+  const host = document.getElementById('stack');
+  host.innerHTML = '';
+  const base = mk(W, H), over = mk(W, H, { alpha: true });
+  base.c.style.zIndex = '0'; over.c.style.zIndex = '1';
+  host.appendChild(base.c); host.appendChild(over.c);
+  const single = mk(W, H);
+  single.c.style.zIndex = '2';
+  host.appendChild(single.c);
+  function show(which) {
+    base.c.style.display = which === 'stack' ? 'block' : 'none';
+    over.c.style.display = which === 'stack' ? 'block' : 'none';
+    single.c.style.display = which === 'stack' ? 'none' : 'block';
+  }
+  function drawLayers() {
+    keys(w, true);
+    drawPass(w, base.ctx, w.kMat, palA, BG);
+    drawPass(w, over.ctx, w.kBand, palKeep, '#ffffff');
+  }
+  const cases = [
+    ['canvas2d multiply, one visible canvas', 'single', () => {
+      drawLayers();
+      const v = single.ctx;
+      v.globalCompositeOperation = 'copy'; v.filter = 'none'; v.drawImage(base.c, 0, 0);
+      v.globalCompositeOperation = 'multiply'; v.drawImage(over.c, 0, 0);
+      v.globalCompositeOperation = 'source-over';
+    }],
+    ['CSS mix-blend-mode: multiply', 'stack', () => { drawLayers(); }],
+    ['CSS mix-blend-mode + filter: invert(1)', 'stack', () => { drawLayers(); }]
+  ];
+  log('P5 -- CSS-stacked canvases against a canvas2d composite.  Compositor work is');
+  log('     invisible to performance.now(), so read frameMs, not cpuMs.');
+  log('  ' + pd('arrangement', 44) + rp('frameMs', 10) + rp('cpuMs', 9) + rp('p95 iv', 9));
+  for (const [name, which, fn] of cases) {
+    statusEl.textContent = 'P5 ' + name;
+    show(which);
+    over.c.style.mixBlendMode = which === 'stack' ? 'multiply' : 'normal';
+    over.c.style.filter = name.indexOf('invert') >= 0 ? 'invert(1)' : 'none';
+    fn();
+    await nextFrame();
+    const r = await sustained(fn, QUICK ? 25 : 55, 8000);
+    const iv = r.iv.slice().sort((a, b) => a - b);
+    const p95 = iv[Math.min(iv.length - 1, (iv.length * 0.95) | 0)] || 0;
+    log('  ' + pd(name, 44) + rp(r.perFrame.toFixed(2), 10) + rp(r.cpu.toFixed(2), 9) +
+        rp(p95.toFixed(2), 9));
+    results.cssStack.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                            p95Interval: +p95.toFixed(2) });
+    await new Promise(z => setTimeout(z, 100));
+  }
+  host.innerHTML = '';
+  log('');
+}
+
+// ===========================================================================
+// P6 -- what actually keeps a canvas accelerated?
+// ===========================================================================
+// P1 found that even a STATIC batched scene loses acceleration, which the
+// path cache alone does not explain: identical paths every frame should hit.
+// So walk the variables one at a time on a fresh canvas each, with the same
+// geometry held still, and read the indicator rather than guessing.
+//
+// The candidates, all from DrawTargetWebgl.cpp:
+//   - novel paths            -> OnCacheMiss every frame, ratio 1.0, fails
+//   - path verbs > 4000      -> no WGR; software rasterise + upload per path
+//   - stroking               -> AAStroke, and a bail-out for strokes whose
+//                               bounds exceed a quarter of the viewport, which
+//                               falls through to Skia and sets mFallbacks
+//   - the first 10 frames    -> RequiresRefresh() is evaluated at frame 10 on
+//                               the CUMULATIVE ratio, and a cold cache means
+//                               the earliest frames are misses by construction
+function accelTrace(drawFn, frames) {
+  return new Promise(resolve => {
+    const tgt = attach(mk(W, H));
+    const cpu = [];
+    let i = 0;
+    function step() {
+      const t0 = performance.now();
+      drawFn(tgt.ctx, i);
+      cpu.push(+(performance.now() - t0).toFixed(2));
+      if (++i >= frames) {
+        requestAnimationFrame(() => {
+          const v = verdict(tgt.c);
+          tgt.c.remove();
+          resolve({ cpu, verdict: v });
+        });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+async function part6(w) {
+  statusEl.textContent = 'P6 what keeps a canvas accelerated...';
+  const frames = QUICK ? 40 : 80;
+  keys(w, false);
+  const nTri = 400;
+  function clearTo(ctx) {
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth = 0.5;
+  }
+  function tris(ctx, stroke, count) {
+    const s = w.s, idx = s.m.idx, sx = s.sx, sy = s.sy;
+    const n = count || nTri;
+    for (let k = 0; k < n; k++) {
+      const t = s.order[k * 7 % Math.max(1, s.nVis)];
+      const a = idx[3 * t], b = idx[3 * t + 1], c = idx[3 * t + 2];
+      ctx.beginPath();
+      ctx.moveTo(sx[a], sy[a]); ctx.lineTo(sx[b], sy[b]); ctx.lineTo(sx[c], sy[c]);
+      const col = palA[k & 7];
+      ctx.fillStyle = col; ctx.fill();
+      if (stroke) { ctx.strokeStyle = col; ctx.stroke(); }
+      ST.fills++; ST.verts += 3;
+    }
+  }
+  function batched(ctx, sm, animate) {
+    if (animate) keys(w, true);
+    clearTo(ctx);
+    w.s.col = w.kMat; w.s.pal = palA;
+    w.R.setTile(2); w.R.batchGridExact(); ST.reset();
+    w.R.emitBoundary(ctx, ST, true, sm);
+  }
+  // Many small paths against few large ones, at matched vertex counts: this is
+  // what separates "too many fill() calls" from "too many path vertices".
+  const cases = [
+    [nTri + ' small triangles, fill only', (ctx) => { clearTo(ctx); tris(ctx, false); }],
+    [nTri + ' small triangles, fill + stroke', (ctx) => { clearTo(ctx); tris(ctx, true); }],
+    ['3000 small triangles (9k verts)', (ctx) => { clearTo(ctx); tris(ctx, false, 3000); }],
+    ['5000 small triangles (15k verts)', (ctx) => { clearTo(ctx); tris(ctx, false, 5000); }],
+    ['fillRect only (nothing to cache)', (ctx) => {
+      clearTo(ctx);
+      for (let k = 0; k < 200; k++) { ctx.fillStyle = palA[k & 7]; ctx.fillRect(k * 6 % W, k * 3 % H, 40, 30); }
+    }],
+    ['batched, fills only', (ctx) => batched(ctx, 0, false)],
+    ['batched, fills + seam strokes', (ctx) => batched(ctx, 2, false)],
+    ['batched, fills + full-boundary strokes', (ctx) => batched(ctx, 1, false)],
+    ['batched, fills only, ANIMATED', (ctx) => batched(ctx, 0, true)],
+    ['batched, fills + seam strokes, ANIMATED', (ctx) => batched(ctx, 2, true)]
+  ];
+  log('P6 -- what keeps a canvas accelerated?  fresh canvas, ' + frames +
+      ' frames, geometry held still unless marked ANIMATED');
+  log('  ' + pd('case', 44) + rp('fills', 7) + rp('verts', 8) + rp('maxPath', 9) +
+      rp('early', 8) + rp('late', 8) + rp('accel', 7));
+  for (const [name, fn] of cases) {
+    statusEl.textContent = 'P6 ' + name;
+    ST.reset();
+    const throwaway = mk(W, H);
+    fn(throwaway.ctx, 0);
+    const fills = ST.fills, verts = ST.verts, maxV = ST.maxFillVerts;
+    const r = await accelTrace(fn, frames);
+    const e = mean(r.cpu, 3, 10), l = mean(r.cpu, frames - 25, frames);
+    log('  ' + pd(name, 44) + rp(fills, 7) + rp(verts, 8) + rp(maxV, 9) +
+        rp(e.toFixed(2), 8) + rp(l.toFixed(2), 8) + rp(r.verdict, 7));
+    results.keepAccel.push({ name, fills, verts, maxFillVerts: maxV,
+      early: +e.toFixed(3), late: +l.toFixed(3), verdict: r.verdict, trace: r.cpu });
+    await new Promise(z => setTimeout(z, 100));
+  }
+  log('');
+}
+
+// ===========================================================================
+// P7 -- where is the cliff?
+// ===========================================================================
+// P6, bisected with about:config, says a batched canvas demotes because of
+// gfx.canvas.accelerated.gpu-path-size (the 4 MB path VERTEX buffer), not
+// because of the cache-miss ratio and not because of the 4000-verb per-path
+// complexity cap.  That buffer is a bump allocator: when a tessellation does
+// not fit in what is left, PathCache::ClearVertexRanges() unlinks EVERY cached
+// tessellation and the buffer restarts.  So the quantity that matters is the
+// total tessellated output for the distinct paths in one frame, and the useful
+// number for an engine is the PATH VERTEX COUNT at which it tips over.
+//
+// Geometry held still, so nothing but the size changes.  Emitting only the
+// first N batches is a clean size knob: same scene, same paths, fewer of them.
+async function part7(w) {
+  statusEl.textContent = 'P7 cliff...';
+  const frames = QUICK ? 40 : 70;
+  keys(w, false);
+  w.s.col = w.kMat; w.s.pal = palA;
+  w.R.setTile(2); w.R.batchGridExact();
+  const nB0 = w.R.nB;
+  log('P7 -- how much path geometry can one canvas draw and stay accelerated?');
+  log('     same scene, same paths every frame, only the number of batches varies.');
+  log('  ' + pd('batches emitted', 18) + rp('fills', 8) + rp('verts', 9) +
+      rp('early', 8) + rp('late', 8) + rp('accel', 7));
+  const fracs = QUICK ? [0.15, 0.4, 0.7, 1.0] : [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0];
+  for (const f of fracs) {
+    const nb = Math.max(1, Math.round(nB0 * f));
+    const fn = (ctx) => {
+      ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+      ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+      ctx.lineWidth = 0.5;
+      w.s.col = w.kMat; w.s.pal = palA;
+      w.R.setTile(2); w.R.batchGridExact();
+      w.R.nB = nb;
+      ST.reset();
+      w.R.emitBoundary(ctx, ST, true, 0);
+    };
+    const throwaway = mk(W, H);
+    fn(throwaway.ctx);
+    const fills = ST.fills, verts = ST.verts;
+    const r = await accelTrace(fn, frames);
+    const e = mean(r.cpu, 3, 10), l = mean(r.cpu, frames - 25, frames);
+    log('  ' + pd(nb + ' / ' + nB0, 18) + rp(fills, 8) + rp(verts, 9) +
+        rp(e.toFixed(2), 8) + rp(l.toFixed(2), 8) + rp(r.verdict, 7));
+    results.cliff.push({ batches: nb, ofBatches: nB0, fills, verts,
+      early: +e.toFixed(3), late: +l.toFixed(3), verdict: r.verdict });
+    await new Promise(z => setTimeout(z, 100));
+  }
+  w.R.nB = nB0;
+  log('');
+}
+
+// ===========================================================================
+// P8 -- is the vertex budget per canvas, or shared?
+// ===========================================================================
+// The path vertex buffer and the path cache are members of SharedContextWebgl,
+// and CanvasTranslator holds exactly one of those, so the source says the
+// budget is global.  That is a strong enough claim about how to architect a
+// multi-pass pipeline that it should not stay an inference.
+//
+// Hold the TOTAL path geometry fixed at a value that demotes a single canvas,
+// split it across K canvases -- each drawing a DIFFERENT slice of the batch
+// list, so the paths are distinct and cannot share cache entries -- and see
+// whether the split rescues them.
+//
+//   per-canvas budget -> at K = 2 each canvas is under the cliff -> ACCEL
+//   shared budget     -> only the total matters                  -> soft at every K
+async function part8(w) {
+  statusEl.textContent = 'P8 shared budget...';
+  const frames = QUICK ? 40 : 70;
+  keys(w, false);
+  w.s.col = w.kMat; w.s.pal = palA;
+  w.R.setTile(2); w.R.batchGridExact();
+  const nB0 = w.R.nB;
+  const nbTotal = Math.round(nB0 * 0.6);      // comfortably over P7's cliff
+  log('P8 -- one canvas or several?  Same total path geometry either way.');
+  log('     the first ' + nbTotal + ' of ' + nB0 + ' batches, split into K contiguous');
+  log('     slices, one per canvas, so no two canvases draw the same path.');
+  log('  ' + pd('K canvases', 12) + rp('verts/canvas', 14) + rp('verts total', 13) +
+      rp('early', 8) + rp('late', 8) + '   accel, per canvas');
+  for (const K of (QUICK ? [1, 2, 4] : [1, 2, 3, 4])) {
+    statusEl.textContent = 'P8 K=' + K;
+    const tgts = [];
+    for (let i = 0; i < K; i++) tgts.push(attach(mk(W, H)));
+    const per = Math.ceil(nbTotal / K);
+    const draw = () => {
+      w.s.col = w.kMat; w.s.pal = palA;
+      w.R.setTile(2); w.R.batchGridExact();
+      const all = w.R.nB;
+      ST.reset();
+      for (let i = 0; i < K; i++) {
+        const ctx = tgts[i].ctx;
+        ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+        ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+        ctx.lineWidth = 0.5;
+        w.R.nB = Math.min(all, per * (i + 1));
+        w.R.emitBoundary(ctx, ST, true, 0, per * i);
+      }
+      w.R.nB = all;
+    };
+    draw();
+    const totVerts = ST.verts, perVerts = Math.round(totVerts / K);
+    const cpu = [];
+    await new Promise(resolve => {
+      let i = 0;
+      function step() {
+        const t0 = performance.now();
+        draw();
+        cpu.push(+(performance.now() - t0).toFixed(2));
+        if (++i >= frames) { requestAnimationFrame(resolve); return; }
+        requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    });
+    const verdicts = tgts.map(t => verdict(t.c));
+    for (const t of tgts) t.c.remove();
+    const e = mean(cpu, 3, 10), l = mean(cpu, frames - 25, frames);
+    log('  ' + pd(String(K), 12) + rp(perVerts, 14) + rp(totVerts, 13) +
+        rp(e.toFixed(2), 8) + rp(l.toFixed(2), 8) + '   ' + verdicts.join(' '));
+    results.shared.push({ K, vertsPerCanvas: perVerts, vertsTotal: totVerts,
+      early: +e.toFixed(3), late: +l.toFixed(3), verdicts });
+    await new Promise(z => setTimeout(z, 120));
+  }
+  log('');
+}
+
+// ===========================================================================
+(async function () {
+  try {
+    const g = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json());
+    if (!g.granted) { statusEl.textContent = 'another instance holds the lease; idling'; return; }
+  } catch (e) { }
+  setInterval(() => { fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }); }, 5000);
+
+  // --- P0: is there a GPU, and is the acceleration indicator available? ----
+  let gpu = 'unknown';
+  try {
+    const gc = document.createElement('canvas');
+    const gl = gc.getContext('webgl2') || gc.getContext('webgl');
+    if (gl) {
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    } else gpu = 'NO WEBGL';
+  } catch (e) { gpu = 'probe failed: ' + e; }
+
+  // a canvas that only fillRects: nothing here can demote it, so if the
+  // indicator is on at all, this corner is green
+  const ctrl = attach(mk(W, H));
+  for (let i = 0; i < 3; i++) {
+    ctrl.ctx.fillStyle = '#204060'; ctrl.ctx.fillRect(0, 0, W, H);
+    await nextFrame();
+  }
+  const ctrlFrac = accelFraction(ctrl.c);
+  INDICATOR = ctrlFrac > 0.8;
+  ctrl.c.remove();
+
+  results.env = { tag: TAG, ua: navigator.userAgent, dpr: devicePixelRatio,
+                  hc: navigator.hardwareConcurrency, gpu, indicator: INDICATOR,
+                  indicatorFraction: +ctrlFrac.toFixed(3) };
+  log('isolation / idioms benchmark -- ' + TAG + '   ' + W + 'x' + H);
+  log('  GPU: ' + gpu);
+  log('  acceleration indicator (gfx.canvas.accelerated.debug): ' +
+      (INDICATOR ? 'AVAILABLE -- accel column is a direct read, not an inference'
+                 : 'not available -- accel column is blank, read the timing step instead'));
+  log('');
+
+  const complex = makeWorld(QUICK ? 256 : 512, QUICK ? 32 : 64);
+  const simple = makeWorld(64, 12);
+  keys(complex, true); keys(simple, true);
+  results.env.simpleVis = simple.s.nVis;
+  results.env.complexVis = complex.s.nVis;
+  results.env.simpleTris = simple.mesh.nt;
+  results.env.complexTris = complex.mesh.nt;
+  log('  scenes: simple = ' + simple.s.nVis + ' visible faces, complex = ' +
+      complex.s.nVis + ' visible faces');
+  log('');
+
+  try {
+    if (PARTS.indexOf('6') >= 0) await part6(complex);
+    if (PARTS.indexOf('7') >= 0) await part7(complex);
+    if (PARTS.indexOf('8') >= 0) await part8(complex);
+    // P1 needs a scene that would OTHERWISE STAY ACCELERATED, or the effect it
+    // is looking for is hidden under the vertex-budget demotion (3.2).
+    if (PARTS.indexOf('1') >= 0) await part1(simple);
+    if (PARTS.indexOf('2') >= 0) await part2([['simple', simple], ['complex', complex]]);
+    if (PARTS.indexOf('3') >= 0) await part3(complex);
+    if (PARTS.indexOf('4') >= 0) await part4(complex);
+    if (PARTS.indexOf('5') >= 0) await part5(complex);
+  } catch (e) {
+    log('ERROR: ' + (e && e.stack || e));
+    results.error = String(e);
+  }
+  results.micro = [{ note: 'iso page complete', contagion: results.contagion.length,
+                     invert: results.invert.length, noclear: results.noclear.length,
+                     slots: results.slots.length, cssStack: results.cssStack.length,
+                     keepAccel: results.keepAccel.length, cliff: results.cliff.length,
+                     shared: results.shared.length }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(results)
+  }).catch(() => { });
+})();
+</script>

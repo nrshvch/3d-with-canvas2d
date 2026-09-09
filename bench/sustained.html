@@ -1,0 +1,128 @@
+<meta charset="utf-8">
+<title>canvas2d sustained throughput (GPU-inclusive)</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #live { border:1px solid #333; width:480px; height:270px; float:right; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<canvas id="live" width="1280" height="720"></canvas>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script src="harness.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// One job: a GPU-inclusive per-draw cost that is not destroyed by vsync
+// quantisation or by Chromium's deep pipelining.
+//
+//   * issue `reps` complete draws inside ONE rAF callback, with reps chosen so
+//     the callback's own CPU time is >= ~50ms.  The presented frame interval
+//     then cannot be shorter than the pipeline's real per-frame cost.
+//   * report total wall time / (frames * reps).  Never a median: Chromium's
+//     intervals alternate 17 / 217 / 17 and the median is a lie.
+//   * report cpuPerDraw alongside, so (perDraw - cpuPerDraw) estimates the
+//     part that performance.now() cannot see.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720;
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'sustained';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp  = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+
+const CASES = [
+  ['per-tri fill+stroke  BASE', (R, c, st) => STRATEGIES.triStroke(R, c, st)],
+  ['grid t2 +ec +stroke',       (R, c, st) => { R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 1); }],
+  ['grid t2 +ec +SEAM stroke',  (R, c, st) => { R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 2); }],
+  ['grid t2 +ec, no stroke',    (R, c, st) => { R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 0); }],
+  ['bands64 runs +ec +stroke',  (R, c, st) => { R.reorderBands(64); R.batchRuns(); R.emitBoundary(c, st, true, 1); }]
+];
+function angleFn(i) { const a = i * 0.021; return [a * 0.7 + 0.4, a, a * 0.31, 3.1, 620]; }
+
+function sustained(fn, R, ctx, reps, frames) {
+  return new Promise(resolve => {
+    const s = R.s, st = new Stats();
+    let i = 0, warm = 6, t0 = 0, n = 0, cpuSum = 0, done = false;
+    clear(ctx, W, H);
+    const wd = setTimeout(() => { if (!done) { done = true; resolve(null); } }, 180000);
+    function step(ts) {
+      if (done) return;
+      if (warm > 0) { warm--; if (warm === 0) { t0 = ts; n = 0; cpuSum = 0; } }
+      const a = angleFn(i++);
+      s.build(a[0], a[1], a[2], a[3], a[4]);
+      st.reset();
+      const c0 = performance.now();
+      for (let r = 0; r < reps; r++) fn(R, ctx, st);
+      if (warm === 0) { cpuSum += performance.now() - c0; n++; }
+      if (warm === 0 && n >= frames) {
+        done = true; clearTimeout(wd);
+        resolve({ perDraw: (ts - t0) / (n * reps), cpuPerDraw: cpuSum / (n * reps),
+                  frameMs: (ts - t0) / n, reps, st });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => {}), 5000);
+  // `micro` stays empty until the whole run is done: the runner treats a
+  // non-empty micro array as the completion signal.
+  const RES = { env: { tag: TAG, ua: navigator.userAgent }, scenes: [], micro: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent + '\n');
+
+  const gpu = mkCanvas(W, H, { alpha: false });
+  gpu.c.style.cssText = 'position:fixed;left:8px;bottom:8px;width:256px;height:144px';
+  document.body.appendChild(gpu.c);
+
+  const tk = makeTorusKnot(512, 64, 3, 7, 8);
+  const scenes = [
+    ['torusKnot indexed', tk, 24, 8],
+    ['torusKnot UNINDEXED', makeUnindexed(tk), 24, 8],
+    ['sphere 256x128', makeSphere(256, 128, 4), 24, 4]
+  ];
+  for (const [nm, mesh, sh, bd] of scenes) {
+    const scene = new Scene(mesh, W, H, sh, bd);
+    const R = new Renderer(scene, 8);
+    scene.build.apply(scene, angleFn(0));
+    const rec = { name: nm, nVis: scene.nVis, rows: [] };
+    log('\n=== ' + nm + '  visible=' + scene.nVis + ' ===');
+    log(pad('case', 28) + rp('fills', 7) + rp('strokes', 8) + rp('verts', 8) + rp('reps', 6) +
+        rp('frameMs', 9) + rp('perDrawMs', 11) + rp('cpuPerDraw', 12) + rp('gpuShare', 10));
+    for (const [label, fn] of CASES) {
+      statusEl.textContent = nm + ' :: ' + label;
+      await new Promise(r => requestAnimationFrame(r));
+      // calibrate reps from pure CPU cost so one callback is >= 50ms
+      const probe = runPass(fn, R, gpu.ctx, W, H, angleFn, 12, false);
+      const reps = Math.max(2, Math.min(64, Math.ceil(50 / Math.max(probe.ms, 0.4))));
+      const r = await sustained(fn, R, gpu.ctx, reps, 40);
+      if (!r) { log(pad(label, 28) + '  (throttled)'); continue; }
+      const row = { case: label, fills: probe.st.fills, strokes: probe.st.strokes, verts: probe.st.verts, reps,
+        frameMs: +r.frameMs.toFixed(2), perDrawMs: +r.perDraw.toFixed(3),
+        cpuPerDrawMs: +r.cpuPerDraw.toFixed(3),
+        gpuShareMs: +(r.perDraw - r.cpuPerDraw).toFixed(3) };
+      rec.rows.push(row);
+      log(pad(label, 28) + rp(row.fills, 7) + rp(row.strokes, 8) + rp(row.verts, 8) + rp(reps, 6) +
+          rp(row.frameMs, 9) + rp(row.perDrawMs, 11) + rp(row.cpuPerDrawMs, 12) + rp(row.gpuShareMs, 10));
+    }
+    RES.scenes.push(rec);
+    await post(TAG, RES);
+  }
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'sustained-only', recMs: 0, rasterMs: 0 });
+  await post(TAG, RES);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>

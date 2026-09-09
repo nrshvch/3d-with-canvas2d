@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="778" height="332" viewBox="0 0 778 332">
+<rect width="778" height="332" fill="#f7f7fa"/>
+<text x="16" y="22" font-family="sans-serif" font-size="12" fill="#1c1c22" font-weight="bold">What has to change to make the dominant class the backdrop, and why the void survives it.</text>
+<text x="16" y="40" font-family="monospace" font-size="13" fill="#1c1c22" font-weight="bold">out  =  F · S · K  +  A</text>
+<text x="16" y="58" font-family="sans-serif" font-size="10.5" fill="#8a8a96">T42 clears the fog buffers only, because K = black over void multiplies the stale fill and shade canvases by zero.</text>
+<text x="16" y="73" font-family="sans-serif" font-size="10.5" fill="#8a8a96">Setting K = white to make band 0 the backdrop ends that, so F and S must now actually be cleared: +2 full-canvas fillRects.</text>
+<text x="34" y="86" font-family="sans-serif" font-size="10" fill="#8a8a96" font-weight="bold">buffer</text>
+<text x="184" y="86" font-family="sans-serif" font-size="10" fill="#8a8a96" font-weight="bold">what it holds</text>
+<text x="364" y="86" font-family="sans-serif" font-size="10" fill="#8a8a96" font-weight="bold">reference background</text>
+<text x="544" y="86" font-family="sans-serif" font-size="10" fill="#8a8a96" font-weight="bold">prepped background</text>
+<rect x="16" y="82" width="746" height="26" fill="none"/>
+<text x="34" y="100" font-family="monospace" font-size="13" fill="#1c1c22" font-weight="bold">F</text>
+<text x="184" y="100" font-family="monospace" font-size="11" fill="#1c1c22">fill / albedo</text>
+<text x="364" y="100" font-family="monospace" font-size="11" fill="#8a8a96">fog colour</text>
+<text x="544" y="100" font-family="monospace" font-size="11" fill="#8a8a96">fog colour</text>
+<rect x="16" y="112" width="746" height="26" fill="rgba(0,0,0,0.02)"/>
+<text x="34" y="130" font-family="monospace" font-size="13" fill="#1c1c22" font-weight="bold">S</text>
+<text x="184" y="130" font-family="monospace" font-size="11" fill="#1c1c22">shade</text>
+<text x="364" y="130" font-family="monospace" font-size="11" fill="#8a8a96">white  (=1)</text>
+<text x="544" y="130" font-family="monospace" font-size="11" fill="#8a8a96">white  (=1)</text>
+<rect x="16" y="142" width="746" height="26" fill="none"/>
+<text x="34" y="160" font-family="monospace" font-size="13" fill="#d02020" font-weight="bold">K</text>
+<text x="184" y="160" font-family="monospace" font-size="11" fill="#1c1c22">fog keep  (1-d)</text>
+<text x="364" y="160" font-family="monospace" font-size="11" fill="#8a8a96">BLACK  (d=1)</text>
+<text x="544" y="160" font-family="monospace" font-size="11" fill="#d02020" font-weight="bold">WHITE  (d=0)</text>
+<rect x="16" y="172" width="746" height="26" fill="rgba(0,0,0,0.02)"/>
+<text x="34" y="190" font-family="monospace" font-size="13" fill="#d02020" font-weight="bold">A</text>
+<text x="184" y="190" font-family="monospace" font-size="11" fill="#1c1c22">fog add  (fog*d)</text>
+<text x="364" y="190" font-family="monospace" font-size="11" fill="#8a8a96">fog colour</text>
+<text x="544" y="190" font-family="monospace" font-size="11" fill="#d02020" font-weight="bold">BLACK  (0)</text>
+<text x="16" y="238" font-family="sans-serif" font-size="11" fill="#1c1c22" font-weight="bold">The void, evaluated in both arrangements:</text>
+<text x="16" y="258" font-family="monospace" font-size="11.5" fill="#1c1c22">reference   out = fog · 1 · 0      + fog   =  fog colour</text>
+<text x="16" y="276" font-family="monospace" font-size="11.5" fill="#1c1c22">prepped     out = fog · 1 · 1      + 0     =  fog colour</text>
+<text x="464" y="267" font-family="sans-serif" font-size="11" fill="#2e8b3d" font-weight="bold">identical, and it is why the drop is exact</text>
+<text x="16" y="298" font-family="sans-serif" font-size="10.5" fill="#8a8a96">Verified against a 2x supersampled reference: composite cdiff 0 of 3 686 400 samples on every scene (T56). The band MAP does differ</text>
+<text x="16" y="312" font-family="sans-serif" font-size="10.5" fill="#8a8a96">over void - exactly the uncovered fraction of the screen - because the fill canvas’s own fog-colour background resolves it.</text>
+</svg>

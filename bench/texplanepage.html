@@ -1,0 +1,201 @@
+<meta charset="utf-8">
+<title>coplanar textured merging</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+  canvas.pv { border:1px solid #333; width:426px; height:240px; margin:2px 6px 10px 0; }
+  .lbl { color:#8fd; margin-top:6px; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+<div id="previews"></div>
+<script src="harness.js"></script>
+<script src="texplane.js"></script>
+<script>
+'use strict';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'texplane';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const raf = () => new Promise(r => requestAnimationFrame(r));
+
+function minRounds(f, rounds, iters) {
+  let best = Infinity;
+  for (let r = 0; r < rounds; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) f();
+    const ms = (performance.now() - t0) / iters;
+    if (ms < best) best = ms;
+  }
+  return best;
+}
+function rmse(a, b) {
+  let sq = 0, g8 = 0, mx = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    const e = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2]));
+    sq += e * e; if (e > 8) g8++; if (e > mx) mx = e;
+  }
+  const n = a.length / 4;
+  return { rmse: +Math.sqrt(sq / n).toFixed(3), gt8: +(100 * g8 / n).toFixed(3), max: mx };
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }), 5000);
+  const RES = { env: { tag: TAG, ua: navigator.userAgent }, scenes: [], micro: [], notes: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent);
+  log('\nperspective-tilted textured plane, 1280x720, 512x512 texture');
+  log('ctx.setTransform is affine; the exact texture->screen map of a plane is a');
+  log('homography, so merging is only exact where w is constant. eps is the');
+  log('screen-space error budget that decides how far a merge may go.\n');
+
+  const W = 1280, H = 720;
+  const gpu = mkCanvas(W, H, { alpha: false });
+  const cpu = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+  const ref = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+
+  // reference: subdivide until the affine fit is within 0.1 px everywhere.
+  // That converges to the exact homography, so it is the right "truth" here.
+  const refLeaves = buildLeaves(0.1);
+  clear(ref.ctx, W, H); emitLeaves(ref.ctx, null);
+  const refData = ref.ctx.getImageData(0, 0, W, H).data;
+  log('reference: adaptive eps=0.1px -> ' + refLeaves + ' fills\n');
+
+  const CASES = [];
+  CASES.push(['uniform 64x64, per-triangle', () => buildUniform(64, true)]);
+  CASES.push(['uniform 64x64, per-quad', () => buildUniform(64, false)]);
+  CASES.push(['uniform 32x32, per-quad', () => buildUniform(32, false)]);
+  CASES.push(['uniform 8x8,   per-quad', () => buildUniform(8, false)]);
+  for (const eps of [0.25, 0.5, 1, 2, 4, 8]) CASES.push(['adaptive eps=' + eps + 'px', () => buildLeaves(eps)]);
+  CASES.push(['single fill (whole plane)', () => buildUniform(1, false)]);
+
+  log(pad('strategy', 30) + rp('fills', 8) + rp('verts', 8) + rp('buildMs', 9) +
+      rp('recMs', 8) + rp('rasterMs', 10) + rp('RMSE', 8) + rp('>8%', 8) + rp('max', 6));
+  const rows = [];
+  for (const [label, build] of CASES) {
+    statusEl.textContent = label;
+    await raf();
+    const st = {};
+    const buildMs = minRounds(build, 3, 2);
+    build();
+    const n = nLeaf;
+    const draw = ctx => { emitLeaves(ctx, st); };
+    for (let i = 0; i < 3; i++) { clear(gpu.ctx, W, H); draw(gpu.ctx); }
+    const rec = minRounds(() => { clear(gpu.ctx, W, H); draw(gpu.ctx); }, 4, 3);
+    await raf();
+    for (let i = 0; i < 2; i++) { clear(cpu.ctx, W, H); draw(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }
+    const ras = minRounds(() => { clear(cpu.ctx, W, H); draw(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }, 3, 2);
+    const q = rmse(cpu.ctx.getImageData(0, 0, W, H).data, refData);
+    const row = { case: label, fills: n, verts: st.verts, buildMs: +buildMs.toFixed(3),
+      recMs: +rec.toFixed(3), rasterMs: +ras.toFixed(2), rmse: q.rmse, gt8: q.gt8, max: q.max };
+    rows.push(row); RES.notes.push(row);
+    log(pad(label, 30) + rp(n, 8) + rp(st.verts, 8) + rp(buildMs.toFixed(2), 9) +
+        rp(rec.toFixed(2), 8) + rp(ras.toFixed(2), 10) + rp(q.rmse, 8) + rp(q.gt8, 8) + rp(q.max, 6));
+    await raf();
+  }
+  RES.scenes.push({ name: 'textured plane', nVis: 0, rows });
+
+  const pv = document.getElementById('previews');
+  for (const [label, build] of [['uniform 64x64 per-triangle (8192 fills)', () => buildUniform(64, true)],
+                                ['adaptive eps=1px', () => buildLeaves(1)],
+                                ['adaptive eps=8px', () => buildLeaves(8)],
+                                ['single fill (whole plane)', () => buildUniform(1, false)]]) {
+    build();
+    const c = mkCanvas(W, H, { alpha: false });
+    c.c.className = 'pv';
+    clear(c.ctx, W, H); emitLeaves(c.ctx, null);
+    const d = document.createElement('div'); d.className = 'lbl';
+    d.textContent = label + '  (' + nLeaf + ' fills)';
+    pv.appendChild(d); pv.appendChild(c.c);
+  }
+
+  // ---- why is the Chromium software backend so slow here? -----------------
+  // Suspicion: this plane's affine maps carry real rotation/shear, whereas the
+  // earlier axis-aligned pattern micro was cheap.  Probe it directly: same
+  // pattern, same fill area, only the matrix differs.
+  log('');
+  log('pattern-fill matrix probe (2000 fills of one 200x200 texture rect):');
+  log(pad('matrix', 34) + rp('recMs', 9) + rp('rasterMs', 11));
+  {
+    const pat = planePattern(gpu.ctx);
+    const mats = [
+      ['identity (axis aligned, 1:1)', [1, 0, 0, 1, 0, 0]],
+      ['scale 2.5 (axis aligned)', [2.5, 0, 0, 2.5, 0, 0]],
+      ['rotate 20 deg', [Math.cos(0.35), Math.sin(0.35), -Math.sin(0.35), Math.cos(0.35), 0, 0]],
+      ['rotate 20 deg + scale 2.5', [2.5 * Math.cos(0.35), 2.5 * Math.sin(0.35), -2.5 * Math.sin(0.35), 2.5 * Math.cos(0.35), 0, 0]],
+      ['shear only', [1, 0, 0.4, 1, 0, 0]]
+    ];
+    for (const [name, m] of mats) {
+      const f = ctx => {
+        ctx.fillStyle = pat;
+        for (let i = 0; i < 2000; i++) {
+          ctx.setTransform(m[0], m[1], m[2], m[3], (i % 17) * 3, (i % 13) * 3);
+          ctx.beginPath();
+          ctx.moveTo(0, 0); ctx.lineTo(200, 0); ctx.lineTo(200, 200); ctx.lineTo(0, 200);
+          ctx.fill();
+        }
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+      };
+      for (let i = 0; i < 2; i++) { clear(gpu.ctx, W, H); f(gpu.ctx); }
+      const rec = minRounds(() => { clear(gpu.ctx, W, H); f(gpu.ctx); }, 3, 2);
+      await raf();
+      for (let i = 0; i < 1; i++) { clear(cpu.ctx, W, H); f(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }
+      const ras = minRounds(() => { clear(cpu.ctx, W, H); f(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }, 2, 1);
+      RES.notes.push({ case: 'matrix probe ' + name, fills: 2000, recMs: +rec.toFixed(3), rasterMs: +ras.toFixed(2) });
+      log(pad(name, 34) + rp(rec.toFixed(2), 9) + rp(ras.toFixed(1), 11));
+      await raf();
+    }
+  }
+
+  // ---- GPU-inclusive sustained for the key cases --------------------------
+  log('');
+  log('sustained, GPU-inclusive (rAF, total wall / frames*reps):');
+  log(pad('strategy', 30) + rp('fills', 8) + rp('perDraw', 10) + rp('cpu', 9) + rp('hidden', 9));
+  for (const [label, build] of [['uniform 64x64, per-triangle', () => buildUniform(64, true)],
+                                ['uniform 64x64, per-quad', () => buildUniform(64, false)],
+                                ['adaptive eps=1px', () => buildLeaves(1)],
+                                ['adaptive eps=4px', () => buildLeaves(4)]]) {
+    statusEl.textContent = 'sustained ' + label;
+    build();
+    const n = nLeaf;
+    const probe = minRounds(() => { clear(gpu.ctx, W, H); emitLeaves(gpu.ctx, null); }, 3, 2);
+    const reps = Math.max(2, Math.min(64, Math.ceil(50 / Math.max(probe, 0.4))));
+    const r = await new Promise(resolve => {
+      let i = 0, warm = 6, t0 = 0, cnt = 0, cpuSum = 0, done = false;
+      const wd = setTimeout(() => { if (!done) { done = true; resolve(null); } }, 90000);
+      function step(ts) {
+        if (done) return;
+        if (warm > 0) { warm--; if (warm === 0) { t0 = ts; cnt = 0; cpuSum = 0; } }
+        const c0 = performance.now();
+        for (let k = 0; k < reps; k++) { clear(gpu.ctx, W, H); emitLeaves(gpu.ctx, null); }
+        if (warm === 0) { cpuSum += performance.now() - c0; cnt++; }
+        if (warm === 0 && cnt >= 25) {
+          done = true; clearTimeout(wd);
+          resolve({ per: (ts - t0) / (cnt * reps), cpu: cpuSum / (cnt * reps) });
+          return;
+        }
+        i++; requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    });
+    if (!r) { log(pad(label, 30) + '  (throttled)'); continue; }
+    RES.notes.push({ case: 'sustained ' + label, fills: n, perDrawMs: +r.per.toFixed(3),
+                     cpuPerDrawMs: +r.cpu.toFixed(3), gpuShareMs: +(r.per - r.cpu).toFixed(3) });
+    log(pad(label, 30) + rp(n, 8) + rp(r.per.toFixed(2), 10) + rp(r.cpu.toFixed(2), 9) +
+        rp((r.per - r.cpu).toFixed(2), 9));
+    await raf();
+  }
+
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'complete', recMs: 0, rasterMs: 0 });
+  await post(TAG, RES);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>

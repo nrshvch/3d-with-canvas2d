@@ -1,0 +1,212 @@
+<meta charset="utf-8">
+<title>can a fog buffer stay accelerated?</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// THE QUESTION THIS PAGE EXISTS FOR
+//
+// A fog buffer is keyed by fog BAND, so it draws ~8-16 novel paths a frame --
+// not the ~900 a full albedo pass draws.  Firefox's usage profile is a RATIO:
+//
+//   frame FAILS when  misses + readbacks + layers
+//                       >  0.66 * (misses + hits + uncachedDraws + readbacks + layers)
+//
+//   ... and  mFallbacks > 0  short-circuits it to FAILED regardless.
+//
+// `OnUncachedDraw()` fires for solid-colour draws with no vertex range, i.e.
+// fillRect.  So with few novel paths and a few fillRects a canvas sits right at
+// the threshold -- and then `difference` (which sets mFallbacks) is the ONLY
+// thing demoting it.  On a 900-path canvas the geometry demotes it anyway,
+// which is why measuring there shows the op as free.  THAT WAS THE MISTAKE.
+//
+// Each case gets a FRESH canvas and a per-frame CPU trace, so the demotion step
+// is visible.  For this workload -- few large paths -- accelerated is FASTER
+// than software (3.2: 6 ms against 18 ms batched), so demotion shows as a step
+// UP.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'accel';
+const FRAMES = +(Q.get('frames') || 120);
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const results = { tag: TAG, micro: [], cases: [] };
+
+function mk(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.style.cssText = 'position:absolute;left:-4000px;top:0;width:320px;height:180px';
+  document.body.appendChild(c);
+  return { c, ctx: c.getContext('2d', { alpha: false }) };
+}
+
+// per-frame trace on a FRESH canvas; returns the series
+function trace(bodyFactory, frames) {
+  return new Promise(resolve => {
+    const tgt = mk(W, H);
+    const body = bodyFactory(tgt.ctx, tgt.c);
+    const cpu = [];
+    let i = 0;
+    function step() {
+      const t0 = performance.now();
+      body(i);
+      cpu.push(+(performance.now() - t0).toFixed(2));
+      if (++i >= frames) { tgt.c.remove(); resolve(cpu); return; }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+(async function () {
+  try {
+    const g = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json());
+    if (!g.granted) { statusEl.textContent = 'another instance holds the lease; idling'; return; }
+  } catch (e) { }
+  setInterval(() => { fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }); }, 5000);
+
+  // --- geometry: the real batcher, keyed by fog band so the path count is
+  // what a fog buffer actually produces
+  const shades = 24, matBands = 8, B = 8;
+  const mesh = makeTorusKnot(512, 64, 3, 7, matBands);
+  const scene = new Scene(mesh, W, H, shades, matBands);
+  const R = new Renderer(scene, 2);
+  const nt = mesh.nt;
+  const kBand = new Int32Array(nt), kMat = new Int32Array(nt);
+  const zc = new Float32Array(nt);
+  const palBand = [], palMat = [];
+  for (let b = 0; b < B; b++) { const v = Math.round(255 * (1 - b / (B - 1))); palBand.push('#' + ((1 << 24) + (v << 16) + (v << 8) + v).toString(16).slice(1)); }
+  for (let m = 0; m < matBands; m++) palMat.push('#' + ((1 << 24) + (((m * 29) & 255) << 16) + (((m * 71) & 255) << 8) + ((m * 113) & 255)).toString(16).slice(1));
+  const st = new Stats();
+  function build(i) {
+    const t = i * 0.021;
+    scene.build(t * 0.7 + 0.4, t, t * 0.31, 3.1, 620);
+    const idx = mesh.idx, sz = scene.sz, n = scene.nVis;
+    let zmin = Infinity, zmax = -Infinity;
+    for (let j = 0; j < n; j++) {
+      const tt = scene.order[j];
+      zc[tt] = (sz[idx[3 * tt]] + sz[idx[3 * tt + 1]] + sz[idx[3 * tt + 2]]) / 3;
+      if (zc[tt] < zmin) zmin = zc[tt];
+      if (zc[tt] > zmax) zmax = zc[tt];
+    }
+    const inv = 1 / Math.max(1e-6, zmax - zmin);
+    for (let j = 0; j < n; j++) {
+      const tt = scene.order[j], c = scene.col[tt];
+      let b = ((zc[tt] - zmin) * inv * (B - 1) + 0.5) | 0;
+      if (b > B - 1) b = B - 1;
+      kBand[tt] = b;
+      kMat[tt] = (c / shades) | 0;
+    }
+  }
+  function emit(ctx, key, pal, bg) {
+    const sc = scene.col, sp = scene.pal;
+    scene.col = key; scene.pal = pal;
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth = 0.5;
+    R.setTile(2); R.batchGridExact(); st.reset(); R.emitBoundary(ctx, st, true, 2);
+    scene.col = sc; scene.pal = sp;
+    return st.fills;
+  }
+  // how many paths do the two shapes actually produce?
+  build(0);
+  const probe = mk(W, H);
+  const fillsBand = emit(probe.ctx, kBand, palBand, '#000000');
+  const fillsMat = emit(probe.ctx, kMat, palMat, BG);
+  probe.c.remove();
+
+  log('can a fog buffer stay accelerated?  ' + TAG + '   ' + W + 'x' + H);
+  log('');
+  log('novel paths per frame:  fog buffer (band-keyed) = ' + fillsBand +
+      '   albedo pass (material-keyed) = ' + fillsMat);
+  log('Firefox fails a frame when  misses > 0.66*(misses+hits+uncachedDraws),');
+  log('i.e. it PASSES when  uncachedDraws > 0.515*misses.  For ' + fillsBand +
+      ' paths that is ' + Math.ceil(0.516 * fillsBand) + ' fillRects.');
+  log('');
+
+  const DILUTE = Math.ceil(0.516 * fillsBand) + 2;      // a small margin
+  function dilute(ctx, n) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#010101';
+    for (let k = 0; k < n; k++) ctx.fillRect(k & 1023, 0, 1, 1);
+  }
+
+  const cases = [
+    ['fog buffer: paths only', (ctx) => (i) => {
+      build(i); emit(ctx, kBand, palBand, '#000000');
+    }],
+    ['  + tint multiply (no invert)', (ctx) => (i) => {
+      build(i); emit(ctx, kBand, palBand, '#000000');
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = '#5a6982'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+    }],
+    ['  + tint + DIFFERENCE (the chain)', (ctx) => (i) => {
+      build(i); emit(ctx, kBand, palBand, '#000000');
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = '#5a6982'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+    }],
+    ['  + tint, no invert, +' + DILUTE + ' fillRects', (ctx) => (i) => {
+      build(i); emit(ctx, kBand, palBand, '#000000');
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = '#5a6982'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+      dilute(ctx, DILUTE);
+    }],
+    ['  + tint + DIFFERENCE, +' + DILUTE + ' fillRects', (ctx) => (i) => {
+      build(i); emit(ctx, kBand, palBand, '#000000');
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = '#5a6982'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+      dilute(ctx, DILUTE);
+    }],
+    ['albedo pass: paths only (' + fillsMat + ' paths)', (ctx) => (i) => {
+      build(i); emit(ctx, kMat, palMat, BG);
+    }],
+    ['albedo pass, +' + Math.ceil(0.516 * fillsMat) + ' fillRects', (ctx) => (i) => {
+      build(i); emit(ctx, kMat, palMat, BG);
+      dilute(ctx, Math.ceil(0.516 * fillsMat) + 4);
+    }]
+  ];
+
+  log('  ' + pd('case', 40) + rp('early', 8) + rp('late', 8) + rp('step', 7) + '   frames 1-16 (ms)');
+  for (const [name, factory] of cases) {
+    statusEl.textContent = name;
+    const tr = await trace(factory, FRAMES);
+    const mean = (a, i, j) => { let s = 0, n = 0; for (let k = i; k < j && k < a.length; k++) { s += a[k]; n++; } return n ? s / n : NaN; };
+    const early = mean(tr, 2, 9), late = mean(tr, FRAMES - 40, FRAMES);
+    log('  ' + pd(name, 40) + rp(early.toFixed(1), 8) + rp(late.toFixed(1), 8) +
+      rp((late / early).toFixed(2) + 'x', 7) + '   ' + tr.slice(0, 16).join(' '));
+    results.cases.push({ name, early: +early.toFixed(2), late: +late.toFixed(2),
+                         step: +(late / early).toFixed(3), trace: tr });
+    await new Promise(z => setTimeout(z, 150));
+  }
+  log('');
+  log('A step UP means the canvas lost acceleration: for few-large-paths work');
+  log('the accelerated backend is FASTER than software (3.2).');
+  results.micro = [{ note: 'accel probe complete', cases: results.cases.length,
+                     fillsBand, fillsMat, dilute: DILUTE }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(results)
+  }).catch(() => { });
+})();
+</script>

@@ -1,0 +1,88 @@
+<meta charset="utf-8">
+<title>canvas2d micro-benchmarks</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+<script src="harness.js"></script>
+<script src="micro.js"></script>
+<script src="state.js"></script>
+<script>
+'use strict';
+// Micro-benchmarks only, with a MIN-of-rounds estimator.
+// The combined run showed sporadic 5-10x outliers in the record column caused
+// by unrelated load on the machine; a mean is useless against that, a minimum
+// is the standard robust estimator for "cost with no interference".
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'micro';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp  = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const raf = () => new Promise(r => requestAnimationFrame(r));
+
+function minRounds(fn, rounds, iters) {
+  let best = Infinity;
+  for (let r = 0; r < rounds; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) fn();
+    const ms = (performance.now() - t0) / iters;
+    if (ms < best) best = ms;
+  }
+  return best;
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => {}), 5000);
+  const RES = { env: { tag: TAG, ua: navigator.userAgent }, scenes: [], micro: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent + '\n');
+  log(pad('case', 48) + rp('recMs', 10) + rp('rasterMs', 11));
+
+  const mg = mkCanvas(1024, 1024, { alpha: false });
+  const mc = mkCanvas(1024, 1024, { alpha: false, willReadFrequently: true });
+  mg.c.style.cssText = 'position:fixed;right:8px;bottom:8px;width:200px;height:200px';
+  document.body.appendChild(mg.c);
+
+  for (const k in MICRO) {
+    statusEl.textContent = k;
+    await raf();
+    const f = MICRO[k];
+    for (let i = 0; i < 3; i++) { clear(mg.ctx, 1024, 1024); f(mg.ctx); }
+    const rms = minRounds(() => { clear(mg.ctx, 1024, 1024); f(mg.ctx); }, 5, 6);
+    await raf();
+    for (let i = 0; i < 2; i++) { clear(mc.ctx, 1024, 1024); f(mc.ctx); mc.ctx.getImageData(0, 0, 1, 1); }
+    const cms = minRounds(() => { clear(mc.ctx, 1024, 1024); f(mc.ctx); mc.ctx.getImageData(0, 0, 1, 1); }, 4, 3);
+    RES.micro.push({ name: k, recMs: +rms.toFixed(3), rasterMs: +cms.toFixed(3) });
+    log(pad(k, 48) + rp(rms.toFixed(3), 10) + rp(cms.toFixed(3), 11));
+  }
+
+  log('\n-- context creation flags (fill-per-tri x8000, record) --');
+  {
+    const f = MICRO['fill-per-tri              (8000 fills, 8000 subpaths)'];
+    const specs = [['alpha:false', { alpha: false }], ['alpha:true', { alpha: true }],
+                   ['alpha:false desynchronized', { alpha: false, desynchronized: true }],
+                   ['alpha:false willReadFrequently', { alpha: false, willReadFrequently: true }]];
+    const cvs = specs.map(([, o]) => mkCanvas(1024, 1024, o));
+    for (let r = 0; r < 3; r++) for (const cv of cvs) { clear(cv.ctx, 1024, 1024); f(cv.ctx); }
+    await raf();
+    for (let k = 0; k < specs.length; k++) {
+      const ms = minRounds(() => { clear(cvs[k].ctx, 1024, 1024); f(cvs[k].ctx); }, 5, 6);
+      RES.micro.push({ name: 'ctxflag ' + specs[k][0], recMs: +ms.toFixed(3), rasterMs: null });
+      log(pad(specs[k][0], 48) + rp(ms.toFixed(3), 10));
+      await raf();
+    }
+  }
+
+  statusEl.textContent = 'DONE';
+  await post(TAG, RES);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>

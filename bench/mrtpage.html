@@ -1,0 +1,240 @@
+<meta charset="utf-8">
+<title>two canvases: interleaved vs sequential</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// A deferred canvas2d pipeline writes several canvases per frame (albedo,
+// shade, fog).  The tempting shape is MRT: one pass over the geometry that
+// writes every target as it goes, so the batching and boundary extraction are
+// done once instead of N times.
+//
+// The hypothesis under test is that this is a LOSS, because each canvas is a
+// separate backend surface: alternating the destination forces a framebuffer
+// bind and flushes whatever draw batch the backend had accumulated.  If so,
+// the correct shape is the opposite of the intuitive one -- finish canvas A
+// completely, then start canvas B, and pay for the extra geometry walk.
+//
+// Two measurements, because they answer different halves:
+//   MICRO     N fillRects, alternating vs sequential.  Isolates the cost of
+//             switching destination, with no path building in the way.
+//   GEOMETRY  the real batcher emitting into two canvases, interleaved via a
+//             fan-out proxy (ONE boundary extraction, two ctx calls) against
+//             sequential (TWO boundary extractions, one ctx call each).
+//             Note the interleaved side does strictly LESS JS work, so if it
+//             still loses, the loss is in the engine.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'mrt';
+const QUICK = Q.get('quick') === '1';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const results = { tag: TAG, micro: [], mrt: [] };
+
+function mk(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return { c, ctx: c.getContext('2d', { alpha: false }) };
+}
+const MINF = 8;
+function sustained(fn, reps, frames, budgetMs) {
+  budgetMs = budgetMs || 4000;
+  return new Promise(resolve => {
+    let t0 = 0, warm = 3;
+    const cpu = [];
+    const wall0 = performance.now();
+    function step(ts) {
+      if (warm > 0) { warm--; for (let i = 0; i < reps; i++) fn(); if (warm === 0) t0 = ts; requestAnimationFrame(step); return; }
+      const c0 = performance.now();
+      for (let i = 0; i < reps; i++) fn();
+      cpu.push(performance.now() - c0);
+      if (cpu.length >= frames || (cpu.length >= MINF && performance.now() - wall0 > budgetMs)) {
+        let s = 0; for (const v of cpu) s += v;
+        resolve({ perFrame: (performance.now() - t0) / cpu.length, cpu: s / cpu.length,
+                  frames: cpu.length, truncated: cpu.length < frames });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MICRO: same number of fillRects, same two destinations, different ordering
+// ---------------------------------------------------------------------------
+async function micro() {
+  statusEl.textContent = 'micro…';
+  const A = mk(W, H), B = mk(W, H);
+  const N = 2000;
+  const xs = new Float32Array(N), ys = new Float32Array(N);
+  for (let i = 0; i < N; i++) { xs[i] = (i * 137) % (W - 40); ys[i] = (i * 71) % (H - 30); }
+  const a = A.ctx, b = B.ctx;
+
+  function seq() {
+    a.fillStyle = '#4080c0';
+    for (let i = 0; i < N; i++) a.fillRect(xs[i], ys[i], 40, 30);
+    b.fillStyle = '#c08040';
+    for (let i = 0; i < N; i++) b.fillRect(xs[i], ys[i], 40, 30);
+  }
+  function alt() {
+    a.fillStyle = '#4080c0'; b.fillStyle = '#c08040';
+    for (let i = 0; i < N; i++) {
+      a.fillRect(xs[i], ys[i], 40, 30);
+      b.fillRect(xs[i], ys[i], 40, 30);
+    }
+  }
+  // a third shape: alternate every K, to see where the penalty starts
+  function chunk(K) {
+    return () => {
+      a.fillStyle = '#4080c0'; b.fillStyle = '#c08040';
+      for (let i = 0; i < N; i += K) {
+        const e = Math.min(N, i + K);
+        for (let j = i; j < e; j++) a.fillRect(xs[j], ys[j], 40, 30);
+        for (let j = i; j < e; j++) b.fillRect(xs[j], ys[j], 40, 30);
+      }
+    };
+  }
+  const cases = [
+    ['sequential (A fully, then B)', seq],
+    ['alternating every draw', alt],
+    ['alternating every 8', chunk(8)],
+    ['alternating every 64', chunk(64)],
+    ['alternating every 500', chunk(500)]
+  ];
+  log('MICRO -- ' + (2 * N) + ' fillRects split over two ' + W + 'x' + H + ' canvases');
+  log('  ' + pd('ordering', 32) + rp('frameMs', 9) + rp('cpuMs', 9) + rp('vs seq', 9));
+  let base = 0;
+  for (const [name, fn] of cases) {
+    const r = await sustained(fn, 1, QUICK ? 30 : 60, 4000);
+    if (base === 0) base = r.perFrame;
+    log('  ' + pd(name, 32) + rp(r.perFrame.toFixed(2), 9) + rp(r.cpu.toFixed(2), 9) +
+      rp((r.perFrame / base).toFixed(2) + 'x', 9));
+    results.micro.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                         vsSeq: +(r.perFrame / base).toFixed(3) });
+    await new Promise(z => setTimeout(z, 60));
+  }
+  log('');
+}
+
+// ---------------------------------------------------------------------------
+// GEOMETRY: the real batcher into two canvases
+// ---------------------------------------------------------------------------
+// Fan-out proxy: every path call goes to both contexts, so the boundary walk
+// happens ONCE.  This is the MRT shape, and the best case for it.
+function DualCtx(a, b) { this.a = a; this.b = b; }
+DualCtx.prototype.beginPath = function () { this.a.beginPath(); this.b.beginPath(); };
+DualCtx.prototype.moveTo = function (x, y) { this.a.moveTo(x, y); this.b.moveTo(x, y); };
+DualCtx.prototype.lineTo = function (x, y) { this.a.lineTo(x, y); this.b.lineTo(x, y); };
+DualCtx.prototype.closePath = function () { };
+DualCtx.prototype.fill = function () { this.a.fill(); this.b.fill(); };
+DualCtx.prototype.stroke = function () { this.a.stroke(); this.b.stroke(); };
+// A faithful MRT has to write DIFFERENT colours to the two targets -- albedo
+// and shade are different per face -- so it pays two DISTINCT style
+// assignments per batch, not one forwarded twice.  1.5 prices a style change
+// at about half a fill, so this is the version that matters.
+Object.defineProperty(DualCtx.prototype, 'fillStyle', {
+  set(v) {
+    this.a.fillStyle = v;
+    this.b.fillStyle = this.twin ? (this.twin[v] || v) : v;
+  } });
+Object.defineProperty(DualCtx.prototype, 'strokeStyle', {
+  set(v) { this.a.strokeStyle = v; this.b.strokeStyle = v; } });
+Object.defineProperty(DualCtx.prototype, 'lineWidth', {
+  set(v) { this.a.lineWidth = v; this.b.lineWidth = v; } });
+
+async function geom(R) {
+  statusEl.textContent = 'geometry…';
+  const A = mk(W, H), B = mk(W, H);
+  const dual = new DualCtx(A.ctx, B.ctx);
+  const st = new Stats();
+  let i = 0;
+  function prep() {
+    const t = i++ * 0.021;
+    R.s.build(t * 0.7 + 0.4, t, t * 0.31, 3.1, 620);
+    R.setTile(2); R.batchGridExact();
+    A.ctx.fillStyle = BG; A.ctx.fillRect(0, 0, W, H);
+    B.ctx.fillStyle = BG; B.ctx.fillRect(0, 0, W, H);
+    A.ctx.lineWidth = 0.5; B.ctx.lineWidth = 0.5;
+  }
+  // a distinct palette for the second target, so the interleaved case pays two
+  // different fillStyle assignments per batch the way a real MRT would
+  const twin = Object.create(null);
+  for (const c of R.s.pal) if (c) twin[c] = '#' + c.slice(1).split('').reverse().join('');
+  const dual2 = new DualCtx(A.ctx, B.ctx); dual2.twin = twin;
+  const cases = [
+    ['sequential (two boundary walks)', () => {
+      prep();
+      st.reset(); R.emitBoundary(A.ctx, st, true, 2);
+      st.reset(); R.emitBoundary(B.ctx, st, true, 2);
+    }],
+    ['interleaved / MRT (one walk)', () => {
+      prep();
+      st.reset(); R.emitBoundary(dual, st, true, 2);
+    }],
+    ['interleaved, distinct styles', () => {
+      prep();
+      st.reset(); R.emitBoundary(dual2, st, true, 2);
+    }],
+    ['one canvas only (reference)', () => {
+      prep();
+      st.reset(); R.emitBoundary(A.ctx, st, true, 2);
+    }]
+  ];
+  log('GEOMETRY -- batcher emitting into two canvases, ' + R.s.nVis + ' visible faces');
+  log('  ' + pd('shape', 34) + rp('frameMs', 9) + rp('cpuMs', 9) + rp('vs seq', 9));
+  let base = 0;
+  for (const [name, fn] of cases) {
+    const r = await sustained(fn, 1, QUICK ? 30 : 60, 8000);
+    if (base === 0) base = r.perFrame;
+    log('  ' + pd(name, 34) + rp(r.perFrame.toFixed(2), 9) + rp(r.cpu.toFixed(2), 9) +
+      rp((r.perFrame / base).toFixed(2) + 'x', 9));
+    results.mrt.push({ name, frameMs: +r.perFrame.toFixed(3), cpuMs: +r.cpu.toFixed(3),
+                       vsSeq: +(r.perFrame / base).toFixed(3) });
+    await new Promise(z => setTimeout(z, 80));
+  }
+  log('');
+}
+
+// ---------------------------------------------------------------------------
+(async function () {
+  try {
+    const g = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json());
+    if (!g.granted) { statusEl.textContent = 'another instance holds the lease; idling'; return; }
+  } catch (e) { }
+  setInterval(() => { fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }); }, 5000);
+
+  const mesh = makeTorusKnot(QUICK ? 256 : 512, QUICK ? 32 : 64, 3, 7, 8);
+  const scene = new Scene(mesh, W, H, 24, 8);
+  scene.build(0.4, 0.9, 0.13, 3.1, 620);
+  const R = new Renderer(scene, 2);
+  log('two-canvas ordering -- ' + TAG + '   ' + W + 'x' + H);
+  log('');
+  try {
+    await micro();
+    await geom(R);
+  } catch (e) {
+    log('ERROR: ' + (e && e.stack || e));
+    results.error = String(e);
+  }
+  // run.js's waitFor() needs micro to be non-empty; it already is if we got here
+  if (!results.micro.length) results.micro = [{ note: 'no micro data' }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(results)
+  }).catch(() => { });
+})();
+</script>

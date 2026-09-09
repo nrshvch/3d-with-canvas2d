@@ -1,0 +1,146 @@
+<meta charset="utf-8">
+<title>seam repair contact sheets</title>
+<style>body{background:#14141a;color:#d8d8e0;font:12px/1.5 ui-monospace,Consolas,monospace;margin:10px}
+canvas{border:1px solid #333;max-width:100%}</style>
+<div id="status">running…</div>
+<div id="sheets"></div>
+<script src="harness.js"></script>
+<script src="cube.js"></script>
+<script src="band.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Contact sheets for 4.8: every option's actual rendered seam, magnified, on a
+// MAGENTA background so any surviving gap is unmistakable, plus the exact gap
+// map beside it.  Posted as PNG data URLs; bench/shots.mjs writes the files
+// into assets/.
+//
+// The gap map is the same black/white differencing the tables use:
+//   beta = |white - black| / 255  is the missing coverage at that pixel,
+// amplified 4x and shown in red.  Zero red = zero gap.
+// ---------------------------------------------------------------------------
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'shots';
+const ZOOM = 7;
+const status = document.getElementById('status');
+
+function mk(W, H, ro) { return mkCanvas(W, H, ro ? { alpha: false, willReadFrequently: true } : { alpha: false }); }
+function render(W, H, prepare, draw, bg) {
+  const c = mk(W, H, true);
+  prepare();
+  c.ctx.setTransform(1, 0, 0, 1, 0, 0);
+  c.ctx.fillStyle = bg; c.ctx.fillRect(0, 0, W, H);
+  draw(c.ctx, null);
+  c.ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return c;
+}
+// exact missing coverage, from a black and a white background
+function gapMap(W, H, prepare, draw, crop) {
+  const b = render(W, H, prepare, draw, '#000').ctx.getImageData(crop[0], crop[1], crop[2], crop[3]).data;
+  const w = render(W, H, prepare, draw, '#fff').ctx.getImageData(crop[0], crop[1], crop[2], crop[3]).data;
+  const out = new Uint8ClampedArray(crop[2] * crop[3] * 4);
+  for (let i = 0; i < out.length; i += 4) {
+    const d = Math.max(Math.abs(w[i] - b[i]), Math.abs(w[i + 1] - b[i + 1]), Math.abs(w[i + 2] - b[i + 2]));
+    const v = Math.min(255, d * 4);
+    out[i] = v; out[i + 1] = 0; out[i + 2] = 0; out[i + 3] = 255;
+  }
+  return out;
+}
+
+function sheet(title, W, H, prepare, cases, crop) {
+  const cw = crop[2] * ZOOM, ch = crop[3] * ZOOM;
+  const cols = 3, LBL = 20, PADX = 8, PADY = 8;
+  const cellW = cw * 2 + 6, cellH = ch + LBL;
+  const sw = cols * cellW + (cols + 1) * PADX;
+  const sh = 30 + Math.ceil(cases.length / cols) * (cellH + PADY) + PADY;
+  const S = mk(sw, sh);
+  const x = S.ctx;
+  x.fillStyle = '#101014'; x.fillRect(0, 0, sw, sh);
+  x.imageSmoothingEnabled = false;
+  x.font = 'bold 13px ui-monospace,Consolas,monospace';
+  x.fillStyle = '#d8d8e0';
+  x.fillText(title, PADX, 20);
+  x.font = '11px ui-monospace,Consolas,monospace';
+  cases.forEach(([label, draw], i) => {
+    const cx = PADX + (i % cols) * (cellW + PADX);
+    const cy = 30 + ((i / cols) | 0) * (cellH + PADY);
+    const r = render(W, H, prepare, draw, '#ff00ff');
+    x.drawImage(r.c, crop[0], crop[1], crop[2], crop[3], cx, cy + LBL, cw, ch);
+    const g = gapMap(W, H, prepare, draw, crop);
+    const tmp = mk(crop[2], crop[3], true);
+    const id = tmp.ctx.createImageData(crop[2], crop[3]);
+    id.data.set(g); tmp.ctx.putImageData(id, 0, 0);
+    x.drawImage(tmp.c, 0, 0, crop[2], crop[3], cx + cw + 6, cy + LBL, cw, ch);
+    tmp.c.width = tmp.c.height = 1; r.c.width = r.c.height = 1;
+    x.fillStyle = '#8fd8ff'; x.fillText(label, cx, cy + 13);
+    x.strokeStyle = '#3a3a44'; x.strokeRect(cx, cy + LBL, cw, ch);
+    x.strokeRect(cx + cw + 6, cy + LBL, cw, ch);
+  });
+  x.fillStyle = '#8a8a96';
+  x.fillText('left: render on magenta (any magenta inside the object is a gap)   right: exact missing coverage, amplified 4x',
+             PADX, sh - 6);
+  return S;
+}
+
+async function main() {
+  status.textContent = 'rendering…';
+  const shots = [];
+
+  // ---- S8 -----------------------------------------------------------------
+  {
+    const ANG = [0.55, 0.72, 3.4, 620];
+    const prep = () => cubeBuild(ANG[0], ANG[1], ANG[2], ANG[3]);
+    prep();
+    // window on the cube edge where two visible faces meet
+    const f = FORD[0], q = CUBE_F[f];
+    let ax = 0, ay = 0;
+    for (let e = 0; e < 4; e++) {
+      const nb = CUBE_ADJ[f][e];
+      if (nb >= 0 && FVIS[nb] && FPOS[nb] > FPOS[f]) {
+        ax = (SX[q[e]] + SX[q[(e + 1) % 4]]) / 2; ay = (SY[q[e]] + SY[q[(e + 1) % 4]]) / 2; break;
+      }
+    }
+    const crop = [Math.round(ax) - 30, Math.round(ay) - 20, 60, 40];
+    const S = sheet('S8 textured cube — the cube edge between two visible faces', CW, CH, prep, [
+      ['0  no repair', (c, s) => drawPerFace(c, s, 0)],
+      ['2  expand all 1px', (c, s) => optExpandAll(c, s, 1.0, false)],
+      ['4  expand far 1px', (c, s) => optExpandAll(c, s, 1.0, true)],
+      ['5f edge band, filled', (c, s) => drawPerFaceQuadBand(c, s, 2.0, 'centred')],
+      ['6  move verts 1px', (c, s) => drawPerFace(c, s, 1.0)],
+      ['8b add + mitre 1px', (c, s) => optNeighbourBandMitred(c, s, 1.0, 4)]
+    ], crop);
+    document.getElementById('sheets').appendChild(S.c);
+    shots.push(['seam-shots-s8', S.c.toDataURL('image/png')]);
+    S.c.width = S.c.height = 1;
+  }
+  status.textContent = 'S14…';
+
+  // ---- S14 ----------------------------------------------------------------
+  {
+    const prep = () => bandBuild(1);
+    prep();
+    const segs = bandSeamSegs();
+    const m = segs[Math.floor(segs.length / 2)];
+    const crop = [Math.round((m[0] + m[2]) / 2) - 30, Math.round((m[1] + m[3]) / 2) - 20, 60, 40];
+    const S = sheet('S14 sawtooth — the middle of the shared run', BW, BH, prep, [
+      ['0  no repair', (c, s) => bandFillOnly(c, s)],
+      ['2  expand all 1px', (c, s) => bandOptExpandAll(c, s, 1.0, false)],
+      ['4  expand far 1px', (c, s) => bandOptExpandAll(c, s, 1.0, true)],
+      ['5f edge band, filled', (c, s) => bandQuadBand(c, s, 2.0, 'centred')],
+      ['6  move verts 1px', (c, s) => bandOutset(c, s, 1.0, 4)],
+      ['8b add + mitre 1px', (c, s) => bandOptNeighbourMitred(c, s, 1.0, 4)]
+    ], crop);
+    document.getElementById('sheets').appendChild(S.c);
+    shots.push(['seam-shots-s14', S.c.toDataURL('image/png')]);
+    S.c.width = S.c.height = 1;
+  }
+
+  status.textContent = 'DONE';
+  await post(TAG, { env: { tag: TAG, ua: navigator.userAgent }, micro: [{ name: 'done' }],
+                    notes: shots.map(([n, d]) => ({ case: n, png: d })) });
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  status.textContent = 'ERROR ' + e;
+  post(TAG, { error: String(e) + '\n' + e.stack, micro: [{}] });
+}), 120));
+</script>

@@ -1,0 +1,194 @@
+<meta charset="utf-8">
+<title>canvas2d painter batching benchmark</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  pre  { white-space:pre; }
+  #live { border:1px solid #333; width:480px; height:270px; float:right; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<canvas id="live" width="1280" height="720"></canvas>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script src="harness.js"></script>
+<script src="micro.js"></script>
+<script>
+'use strict';
+const W = 1280, H = 720;
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'manual';
+const QUICK = Q.get('quick') === '1';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+function log(s) { out.textContent += s + '\n'; }
+function setStatus(s) { statusEl.textContent = s; }
+function pad(s, n) { s = String(s); while (s.length < n) s += ' '; return s; }
+function rpad(s, n) { s = String(s); while (s.length < n) s = ' ' + s; return s; }
+
+// --- the contenders --------------------------------------------------------
+const S = STRATEGIES;
+const LW = (c, w) => { c.lineWidth = w; };
+const CASES = [
+  // Stroking is a CONSTRAINT, not an option: it is the only way canvas2d can
+  // close a conflation seam.  Every row strokes except the first, kept only to
+  // show what the seams cost.  lineWidth is swept because the conventional
+  // value of 1 turns out to over-correct: it shifts every colour boundary by
+  // half a pixel toward whichever side is stroked last.
+  ['0  per-tri fill only (seamy)', (R, c, st) => S.tri(R, c, st)],
+  ['0s per-tri f+s lw1.0  BASE',   (R, c, st) => { LW(c, 1.0);  S.triStroke(R, c, st); }],
+  ['0s per-tri f+s lw0.5',         (R, c, st) => { LW(c, 0.5);  S.triStroke(R, c, st); LW(c, 1); }],
+  ['6s grid+stroke lw1.0',         (R, c, st) => { LW(c, 1.0);  R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 1); }],
+  ['6s grid+stroke lw0.75',        (R, c, st) => { LW(c, 0.75); R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 1); LW(c, 1); }],
+  ['6s grid+stroke lw0.5',         (R, c, st) => { LW(c, 0.5);  R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 1); LW(c, 1); }],
+  ['6s grid+stroke lw0.35',        (R, c, st) => { LW(c, 0.35); R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 1); LW(c, 1); }],
+  ['6q grid+SEAM stroke lw1.0',    (R, c, st) => { LW(c, 1.0);  R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 2); }],
+  ['6q grid+SEAM stroke lw0.5',    (R, c, st) => { LW(c, 0.5);  R.setTile(2); R.batchGridExact(); R.emitBoundary(c, st, true, 2); LW(c, 1); }],
+  ['B64 bands64 +ec +s lw0.5',     (R, c, st) => { LW(c, 0.5);  R.reorderBands(64); R.batchRuns(); R.emitBoundary(c, st, true, 1); LW(c, 1); }],
+  ['X  colourOnly +s (INVALID)',   (R, c, st) => { LW(c, 1.0);  R.batchColorOnly(); R.emitBoundary(c, st, true, 1); }]
+];
+const BASE = CASES[0][1];
+
+function angleFn(i) { const a = i * 0.021; return [a * 0.7 + 0.4, a, a * 0.31, 3.1, 620]; }
+
+function buildScenes() {
+  const tk = makeTorusKnot(512, 64, 3, 7, 8);
+  const s = [
+    { name: 'torusKnot indexed   (65k tri, 192 colours, self-overlapping)',
+      mesh: tk, shades: 24, bands: 8 },
+    { name: 'torusKnot UNINDEXED (same geometry, no shared vertex ids)',
+      mesh: makeUnindexed(tk), shades: 24, bands: 8 },
+    { name: 'sphere 256x128      (65k tri, 96 colours, single depth layer)',
+      mesh: makeSphere(256, 128, 4), shades: 24, bands: 4 }
+  ];
+  return QUICK ? [s[0]] : s;
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { setStatus('duplicate page instance -- idle'); log('another live instance holds the lease for tag ' + TAG); return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => {}), 5000);
+  RESULTS.env = { tag: TAG, ua: navigator.userAgent, dpr: devicePixelRatio, hc: navigator.hardwareConcurrency };
+  log('TAG ' + TAG);
+  log('UA  ' + navigator.userAgent);
+  log('dpr=' + devicePixelRatio + '  cores=' + navigator.hardwareConcurrency);
+
+  const gpu = mkCanvas(W, H, { alpha: false });
+  const cpu = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+  const live = document.getElementById('live').getContext('2d', { alpha: false });
+
+  for (const sc of buildScenes()) {
+    const scene = new Scene(sc.mesh, W, H, sc.shades, sc.bands);
+    const R = new Renderer(scene, 8);
+    scene.build.apply(scene, angleFn(0));
+    const rec = { name: sc.name, nTri: sc.mesh.nt, nVis: scene.nVis, rows: [] };
+    rec.sceneMs = +runScenePass(R, angleFn, 30).toFixed(3);
+
+    log('\n\n=== ' + sc.name + ' ===');
+    log('visible=' + scene.nVis + '   transform+cull+shade+radixsort = ' + rec.sceneMs + ' ms/frame');
+    setStatus(sc.name + ' :: building 4x supersampled ground truths');
+    await nextFrame();
+    const gtFill = groundTruth(BASE, R, W, H, angleFn(7), 4, 0);
+    await nextFrame();
+    const gtSeam = groundTruth(S.triStroke, R, W, H, angleFn(7), 4, 1);
+    rec.truthDelta = compareTo(gtFill, gtSeam, W, H);
+    log('4x references differ from each other by rmse ' + rec.truthDelta.rmse +
+        ' (fill-only vs fill+stroke) -- the residual seam in the fill-only reference');
+    log(pad('case', 30) + rpad('fills', 8) + rpad('strokes', 9) + rpad('verts', 9) +
+        rpad('recMs', 8) + rpad('rasterMs', 10) +
+        '  rmseFill rmseSeam   >48%   vsBase%');
+
+    for (const [label, fn] of CASES) {
+      setStatus(sc.name + ' :: ' + label);
+      await nextFrame();
+      const a = runPass(fn, R, gpu.ctx, W, H, angleFn, 25, false);
+      const b = runPass(fn, R, cpu.ctx, W, H, angleFn, QUICK ? 4 : 8, true);
+      const t = { perDrawMs: NaN, reps: 0, frameMs: 0, throttled: true };
+      const v = validate(BASE, fn, R, W, H, angleFn(7));
+      const img = renderToData(fn, R, W, H, angleFn(7));
+      const g = compareTo(gtFill, img, W, H);
+      const g2 = compareTo(gtSeam, img, W, H);
+      scene.build.apply(scene, angleFn(7));
+      const st2 = new Stats(); clear(live, W, H); fn(R, live, st2);
+
+      const row = {
+        case: label, fills: a.st.fills, subpaths: a.st.subpaths, verts: a.st.verts,
+        recMs: +a.ms.toFixed(3), thruMs: +t.perDrawMs.toFixed(3), reps: t.reps,
+        frameMs: +(t.frameMs || 0).toFixed(2), throttled: !!t.throttled,
+        rasterMs: +b.ms.toFixed(3), diff: v, truth: g, truthSeam: g2,
+        strokes: a.st.strokes
+      };
+      rec.rows.push(row);
+      log(pad(label, 30) + rpad(a.st.fills, 8) + rpad(a.st.strokes, 9) + rpad(a.st.verts, 9) +
+          rpad(a.ms.toFixed(2), 8) + rpad(b.ms.toFixed(2), 10) +
+          rpad(g.rmse, 10) + rpad(g2.rmse, 9) + rpad(g2.gt48Pct, 7) + rpad(v.anyPct, 10));
+    }
+    if (!rec.probeDone) {
+      setStatus(sc.name + ' :: acceleration-demotion probe');
+      await nextFrame();
+      rec.probeBaseline = await demotionProbe(CASES[1][1], R, W, H, angleFn, QUICK ? 30 : 60);
+      rec.probeBatched  = await demotionProbe(CASES[2][1], R, W, H, angleFn, QUICK ? 30 : 60);
+      rec.probeDone = true;
+      const f = a => a.length ? [a[2], a[5], a[9], a[14], a[24], a[44], a[a.length - 1]] : [];
+      log('  demotion probe (frame interval ms @ f2,f5,f9,f14,f24,f44,last)');
+      log('    baseline        ' + JSON.stringify(f(rec.probeBaseline.iv)));
+      log('    gridExact t4    ' + JSON.stringify(f(rec.probeBatched.iv)));
+      log('    baseline cpu    ' + JSON.stringify(f(rec.probeBaseline.cpuMs)));
+      log('    gridExact t4 cpu' + JSON.stringify(f(rec.probeBatched.cpuMs)));
+    }
+    RESULTS.scenes.push(rec);
+    await post(TAG, RESULTS);
+  }
+
+  // ---- micro ---------------------------------------------------------------
+  log('\n\n=== MICRO (1024x1024, identical geometry, only API shape differs) ===');
+  log(pad('case', 46) + rpad('recMs', 10) + rpad('rasterMs', 11));
+  const mg = mkCanvas(1024, 1024, { alpha: false });
+  const mc = mkCanvas(1024, 1024, { alpha: false, willReadFrequently: true });
+  for (const k in MICRO) {
+    setStatus('micro: ' + k);
+    await nextFrame();
+    const f = MICRO[k];
+    for (let i = 0; i < 3; i++) { clear(mg.ctx, 1024, 1024); f(mg.ctx); }
+    const rms = timeLoop(() => { clear(mg.ctx, 1024, 1024); f(mg.ctx); }, QUICK ? 6 : 16);
+    for (let i = 0; i < 2; i++) { clear(mc.ctx, 1024, 1024); f(mc.ctx); mc.ctx.getImageData(0, 0, 1, 1); }
+    const cms = timeLoop(() => { clear(mc.ctx, 1024, 1024); f(mc.ctx); mc.ctx.getImageData(0, 0, 1, 1); }, QUICK ? 3 : 6);
+    RESULTS.micro.push({ name: k, recMs: +rms.toFixed(3), rasterMs: +cms.toFixed(3) });
+    log(pad(k, 46) + rpad(rms.toFixed(3), 10) + rpad(cms.toFixed(3), 11));
+  }
+
+  log('\n=== context flags (fill-per-tri x8000, record only) ===');
+  {
+    const f = MICRO['fill-per-tri              (8000 fills, 8000 subpaths)'];
+    const flagSpecs = [['alpha:false', { alpha: false }], ['alpha:true', { alpha: true }],
+                       ['alpha:false desynchronized', { alpha: false, desynchronized: true }],
+                       ['alpha:false willReadFrequently', { alpha: false, willReadFrequently: true }]];
+    // create + warm ALL of them first: a cold GPU canvas allocation inside the
+    // timed loop was producing a 6x phantom difference in the first run
+    const cvs = flagSpecs.map(([, o]) => mkCanvas(1024, 1024, o));
+    for (let round = 0; round < 3; round++)
+      for (const cv of cvs) { clear(cv.ctx, 1024, 1024); f(cv.ctx); }
+    await nextFrame();
+    const acc = flagSpecs.map(() => 0);
+    for (let round = 0; round < 3; round++) {          // interleave to cancel drift
+      for (let k = 0; k < cvs.length; k++)
+        acc[k] += timeLoop(() => { clear(cvs[k].ctx, 1024, 1024); f(cvs[k].ctx); }, 8);
+      await nextFrame();
+    }
+    for (let k = 0; k < flagSpecs.length; k++) {
+      const ms = acc[k] / 3;
+      RESULTS.micro.push({ name: 'ctxflag ' + flagSpecs[k][0], recMs: +ms.toFixed(3), rasterMs: null });
+      log(pad(flagSpecs[k][0], 46) + rpad(ms.toFixed(3), 10));
+    }
+  }
+
+  setStatus('DONE');
+  window.__DONE__ = true; window.__RESULTS__ = RESULTS;
+  await post(TAG, RESULTS);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => {
+  main().catch(e => { setStatus('ERROR ' + e); log('ERROR ' + e + '\n' + e.stack); post(TAG, { error: String(e), stack: e.stack }); });
+}, 120));
+</script>

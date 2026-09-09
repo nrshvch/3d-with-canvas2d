@@ -1,0 +1,486 @@
+<meta charset="utf-8">
+<title>fog on WebGL, canvas2d keeps fill + shade</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// FOG ON WEBGL, canvas2d KEEPS THE FILL AND SHADE PASSES.
+//
+// The fill pass has to stay canvas2d: pattern fills for textured faces,
+// analytic antialiasing, and the seam machinery of 4.4.  Merging fog or shade
+// into it brings the AA seam gaps back, so that is off the table.  What is on
+// the table is moving the FOG STAGE off canvas2d entirely.
+//
+//   C0  the shipped chain          fill, shade, fog(keep) on canvas2d;
+//                                  x keep, invert(difference), tint, + add
+//                                  -> 5 full-canvas ops, one unaccelerated,
+//                                     and it sets mFallbacks every frame
+//   W1  WebGL composites           fill, shade, fog(d) on canvas2d;
+//                                  upload 2 textures, one shader does
+//                                  mix(scene, fogColor, d)
+//                                  -> ZERO canvas2d composite ops
+//   W2  WebGL rasterises the fog   fill, shade on canvas2d; upload 1 texture
+//                                  plus the GEOMETRY, and let the GPU
+//                                  interpolate depth behind a real depth
+//                                  buffer
+//                                  -> zero composites AND no fog geometry
+//                                     pass, and the fog is per-pixel EXACT:
+//                                     no bands, no banding cost, no halo
+//
+// W2 interpolates 1/z, not z, because 1/z is the quantity that is linear in
+// screen space (8.4).  Radial fog is a different one-liner in the shader.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const FOG = [90 / 255, 105 / 255, 130 / 255];
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'webglfog';
+const FRAMES = +(Q.get('frames') || 90);
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const results = { tag: TAG, micro: [], cases: [] };
+// NB: scene.js already declares a global hex2(); a second top-level
+// declaration is a SyntaxError that kills this whole script silently.
+const h2 = v => ('0' + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2);
+const hex = (r, g, b) => '#' + h2(r) + h2(g) + h2(b);
+
+function mk2d(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return { c, ctx: c.getContext('2d', { alpha: false }) };
+}
+function sustained(body, frames) {
+  return new Promise(resolve => {
+    const cpu = []; let i = 0, t0 = 0, warm = 5;
+    function step(ts) {
+      if (warm > 0) { warm--; body(i++); if (warm === 0) t0 = ts; requestAnimationFrame(step); return; }
+      const c0 = performance.now();
+      body(i++);
+      cpu.push(performance.now() - c0);
+      if (cpu.length >= frames) {
+        let s = 0; for (const v of cpu) s += v;
+        resolve({ frameMs: (ts - t0) / cpu.length, cpuMs: s / cpu.length, trace: cpu.slice(0, 14).map(v => +v.toFixed(1)) });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+// ---------------------------------------------------------------------------
+function shader(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(gl, vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, shader(gl, gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+(async function () {
+  try {
+    const g = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json());
+    if (!g.granted) { statusEl.textContent = 'another instance holds the lease; idling'; return; }
+  } catch (e) { }
+  setInterval(() => { fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }); }, 5000);
+
+  // ---- scene + the canvas2d passes ---------------------------------------
+  const shades = 24, matBands = 8, B = 8;
+  const mesh = makeTorusKnot(512, 64, 3, 7, matBands);
+  const scene = new Scene(mesh, W, H, shades, matBands);
+  const R = new Renderer(scene, 2);
+  const nt = mesh.nt, st = new Stats();
+
+  const kMat = new Int32Array(nt), kSh = new Int32Array(nt), kBand = new Int32Array(nt);
+  const zc = new Float32Array(nt);
+  const palMat = [], palSh = [], palKeep = [], palD = [];
+  const palRGB = scene.palRGB;
+  for (let m = 0; m < matBands; m++) {
+    const i = (m * shades + shades - 1) * 3;
+    palMat.push(hex(palRGB[i], palRGB[i + 1], palRGB[i + 2]));
+  }
+  for (let k = 0; k < shades; k++) { const v = (0.14 + 0.80 * (k / (shades - 1))) * 255; palSh.push(hex(v, v, v)); }
+  for (let b = 0; b < B; b++) {
+    const d = b / (B - 1);
+    palKeep.push(hex((1 - d) * 255, (1 - d) * 255, (1 - d) * 255));
+    palD.push(hex(d * 255, d * 255, d * 255));
+  }
+  let zmin = 0, zmax = 1;
+  function build(i) {
+    const t = i * 0.021;
+    scene.build(t * 0.7 + 0.4, t, t * 0.31, 3.1, 620);
+    const idx = mesh.idx, sz = scene.sz, n = scene.nVis;
+    zmin = Infinity; zmax = -Infinity;
+    for (let j = 0; j < n; j++) {
+      const tt = scene.order[j];
+      zc[tt] = (sz[idx[3 * tt]] + sz[idx[3 * tt + 1]] + sz[idx[3 * tt + 2]]) / 3;
+      if (zc[tt] < zmin) zmin = zc[tt];
+      if (zc[tt] > zmax) zmax = zc[tt];
+    }
+    const inv = 1 / Math.max(1e-6, zmax - zmin);
+    for (let j = 0; j < n; j++) {
+      const tt = scene.order[j], c = scene.col[tt];
+      let b = ((zc[tt] - zmin) * inv * (B - 1) + 0.5) | 0;
+      if (b > B - 1) b = B - 1;
+      kMat[tt] = (c / shades) | 0; kSh[tt] = c % shades; kBand[tt] = b;
+    }
+  }
+  function emit(ctx, key, pal, bg) {
+    const sc = scene.col, sp = scene.pal;
+    scene.col = key; scene.pal = pal;
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth = 0.5;
+    R.setTile(2); R.batchGridExact(); st.reset(); R.emitBoundary(ctx, st, true, 2);
+    scene.col = sc; scene.pal = sp;
+  }
+
+  // add map (F*d on black) and the ALPHA map (rgba(F,d)) -- the latter is only
+  // usable now that the halo turned out to come from the fill pass drawing over
+  // void, not from the fog buffers, so the fog map no longer has to be opaque.
+  const palAdd = [], palAlpha = [];
+  for (let b = 0; b < B; b++) {
+    const d = b / (B - 1);
+    palAdd.push(hex(FOG[0] * 255 * d, FOG[1] * 255 * d, FOG[2] * 255 * d));
+    palAlpha.push('rgba(' + Math.round(FOG[0] * 255) + ',' + Math.round(FOG[1] * 255) +
+                  ',' + Math.round(FOG[2] * 255) + ',' + d.toFixed(4) + ')');
+  }
+  const twinKeepAdd = Object.create(null);
+  for (let b = 0; b < B; b++) twinKeepAdd[palKeep[b]] = palAdd[b];
+
+  const fill = mk2d(W, H), shade = mk2d(W, H), fogc = mk2d(W, H), vis2d = mk2d(W, H);
+  const fogAdd = mk2d(W, H);
+  // the alpha map needs a TRANSPARENT canvas
+  const fogA = (() => {
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    return { c, ctx: c.getContext('2d', { alpha: true }) };
+  })();
+
+  // Build each band's boundary ONCE as a Path2D and fill it into both fog
+  // canvases: one boundary extraction, one path construction, two fills.
+  // 1.5 prices a Path2D at ~1.6x a context path, so reusing it twice is the
+  // case where that inverts.
+  function ReuseCtx(a, b, twin) { this.a = a; this.b = b; this.twin = twin; this.p = null; }
+  ReuseCtx.prototype.beginPath = function () { this.p = new Path2D(); };
+  ReuseCtx.prototype.moveTo = function (x, y) { this.p.moveTo(x, y); };
+  ReuseCtx.prototype.lineTo = function (x, y) { this.p.lineTo(x, y); };
+  ReuseCtx.prototype.closePath = function () { };
+  ReuseCtx.prototype.fill = function () { this.a.fill(this.p); this.b.fill(this.p); };
+  ReuseCtx.prototype.stroke = function () { this.a.stroke(this.p); this.b.stroke(this.p); };
+  Object.defineProperty(ReuseCtx.prototype, 'fillStyle', {
+    set(v) { this.a.fillStyle = v; this.b.fillStyle = this.twin[v] || v; } });
+  Object.defineProperty(ReuseCtx.prototype, 'strokeStyle', {
+    set(v) { this.a.strokeStyle = v; this.b.strokeStyle = this.twin[v] || v; } });
+  Object.defineProperty(ReuseCtx.prototype, 'lineWidth', {
+    set(v) { this.a.lineWidth = v; this.b.lineWidth = v; } });
+
+  // batch once on a key, then emit as many times as you like
+  function batchKey(key) { scene.col = key; R.setTile(2); R.batchGridExact(); }
+  function emitWith(ctx, pal) {
+    const sp = scene.pal; scene.pal = pal;
+    ctx.lineWidth = 0.5; st.reset(); R.emitBoundary(ctx, st, true, 2);
+    scene.pal = sp;
+  }
+  function clear2d(ctx, bg) {
+    ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+    if (bg === null) { ctx.clearRect(0, 0, W, H); return; }
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  }
+  // the two canvas2d passes every case shares: fill, then shade multiplied on
+  const FOGHEX = hex(FOG[0] * 255, FOG[1] * 255, FOG[2] * 255);
+  function fillShade(i, target) {
+    build(i);
+    // Pre-fill the FILL pass with the fog colour, not the background colour.
+    // That is where the halo came from: the fill pass drawing over void, so
+    // every face contour carried its antialiased edge against nothing and the
+    // contour showed up after the multiply.  With the fill canvas already fog
+    // coloured there is nothing for the edge to reveal.
+    emit(fill.ctx, kMat, palMat, FOGHEX);
+    emit(shade.ctx, kSh, palSh, '#ffffff');
+    target.globalCompositeOperation = 'copy'; target.drawImage(fill.c, 0, 0);
+    target.globalCompositeOperation = 'multiply'; target.drawImage(shade.c, 0, 0);
+    target.globalCompositeOperation = 'source-over';
+  }
+
+  // ---- WebGL ------------------------------------------------------------
+  const glc = document.createElement('canvas');
+  glc.width = W; glc.height = H;
+  const gl = glc.getContext('webgl2', { alpha: false, antialias: false, depth: true,
+                                        preserveDrawingBuffer: false, desynchronized: false });
+  if (!gl) { log('no webgl2'); return; }
+
+  const QUAD_VS = `#version 300 es
+  in vec2 aP; out vec2 vT;
+  void main(){ vT = aP*0.5+0.5; gl_Position = vec4(aP,0.,1.); }`;
+  // W1: two textures, one mix
+  const W1_FS = `#version 300 es
+  precision highp float;   // must match the VS: uniforms shared with a
+                         // vertex shader default to highp, and a mediump
+                         // redeclaration is a LINK error
+  in vec2 vT; uniform sampler2D uScene, uFog; uniform vec3 uFogColor;
+  out vec4 o;
+  void main(){
+    vec2 t = vec2(vT.x, 1.0-vT.y);            // canvas is y-down
+    float d = texture(uFog, t).r;
+    o = vec4(mix(texture(uScene, t).rgb, uFogColor, d), 1.0);
+  }`;
+  // W2: fog rasterised from geometry, depth-tested, per-pixel exact
+  const W2_VS = `#version 300 es
+  in vec2 aP; in float aIW;                   // screen px, and 1/z
+  uniform vec2 uRes; uniform vec2 uZ;         // uZ = (zmin, zmax)
+  out float vIW;
+  void main(){
+    vIW = aIW;
+    float z = 1.0/aIW;
+    float nd = clamp((z-uZ.x)/max(1e-6,(uZ.y-uZ.x)), 0.0, 1.0);
+    vec2 c = vec2(aP.x/uRes.x*2.0-1.0, 1.0-aP.y/uRes.y*2.0);
+    gl_Position = vec4(c, nd*2.0-1.0, 1.0);   // linear in view z: monotone, so
+  }`;                                          // the depth test orders correctly
+  const W2_FS = `#version 300 es
+  precision highp float;   // must match the VS: uniforms shared with a
+                         // vertex shader default to highp, and a mediump
+                         // redeclaration is a LINK error
+  in float vIW; uniform sampler2D uScene; uniform vec3 uFogColor;
+  uniform vec2 uRes; uniform vec2 uZ;
+  out vec4 o;
+  void main(){
+    float z = 1.0/vIW;                        // 1/z is what is linear in screen space
+    float d = clamp((z-uZ.x)/max(1e-6,(uZ.y-uZ.x)), 0.0, 1.0);
+    vec2 t = vec2(gl_FragCoord.x/uRes.x, gl_FragCoord.y/uRes.y);
+    o = vec4(mix(texture(uScene, t).rgb, uFogColor, d), 1.0);
+  }`;
+  let pQuad, pGeom;
+  try {
+    pQuad = program(gl, QUAD_VS, W1_FS);
+    pGeom = program(gl, W2_VS, W2_FS);
+  } catch (e) {
+    log('SHADER ERROR: ' + e.message);
+    statusEl.textContent = 'shader error';
+    results.error = String(e.message);
+    results.micro = [{ note: 'shader error' }];
+    await fetch('/result?tag=' + encodeURIComponent(TAG), { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(results) }).catch(() => { });
+    return;
+  }
+
+  const quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+
+  function tex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  const texScene = tex(), texFog = tex();
+  function upload(t, canvas) {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  }
+
+  // geometry buffers for W2, sized once
+  const MAXV = mesh.nt * 3;
+  const posBuf = gl.createBuffer(), iwBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, MAXV * 2 * 4, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, iwBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, MAXV * 4, gl.DYNAMIC_DRAW);
+  const posArr = new Float32Array(MAXV * 2), iwArr = new Float32Array(MAXV);
+  function packGeom() {
+    const idx = mesh.idx, sx = scene.sx, sy = scene.sy, sz = scene.sz;
+    const n = scene.nVis, order = scene.order;
+    let k = 0;
+    for (let j = 0; j < n; j++) {
+      const t = order[j];
+      for (let e = 0; e < 3; e++) {
+        const v = idx[3 * t + e];
+        posArr[k * 2] = sx[v]; posArr[k * 2 + 1] = sy[v];
+        iwArr[k] = 1 / sz[v];
+        k++;
+      }
+    }
+    return k;
+  }
+
+  // ---- the cases --------------------------------------------------------
+  const cases = [
+    ['C0  shipped chain, all canvas2d', (i) => {
+      fillShade(i, vis2d.ctx);
+      emit(fogc.ctx, kBand, palKeep, '#000000');
+      const v = vis2d.ctx, f = fogc.ctx;
+      v.globalCompositeOperation = 'multiply'; v.drawImage(fogc.c, 0, 0);
+      f.globalCompositeOperation = 'difference';
+      f.fillStyle = '#ffffff'; f.fillRect(0, 0, W, H);
+      f.globalCompositeOperation = 'multiply';
+      f.fillStyle = hex(FOG[0] * 255, FOG[1] * 255, FOG[2] * 255); f.fillRect(0, 0, W, H);
+      f.globalCompositeOperation = 'source-over';
+      v.globalCompositeOperation = 'lighter'; v.drawImage(fogc.c, 0, 0);
+      v.globalCompositeOperation = 'source-over';
+    }],
+    ['B2  keep + add, 1 batch 2 emits, no invert', (i) => {
+      fillShade(i, vis2d.ctx);
+      batchKey(kBand);
+      clear2d(fogc.ctx, '#ffffff'); emitWith(fogc.ctx, palKeep);
+      clear2d(fogAdd.ctx, '#000000'); emitWith(fogAdd.ctx, palAdd);
+      const v = vis2d.ctx;
+      v.globalCompositeOperation = 'multiply'; v.drawImage(fogc.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(fogAdd.c, 0, 0);
+      v.globalCompositeOperation = 'source-over';
+    }],
+    ['B3  keep + add, ONE path built, filled twice', (i) => {
+      fillShade(i, vis2d.ctx);
+      batchKey(kBand);
+      clear2d(fogc.ctx, '#ffffff'); clear2d(fogAdd.ctx, '#000000');
+      emitWith(new ReuseCtx(fogc.ctx, fogAdd.ctx, twinKeepAdd), palKeep);
+      const v = vis2d.ctx;
+      v.globalCompositeOperation = 'multiply'; v.drawImage(fogc.c, 0, 0);
+      v.globalCompositeOperation = 'lighter'; v.drawImage(fogAdd.c, 0, 0);
+      v.globalCompositeOperation = 'source-over';
+    }],
+    ['A1  ALPHA fog map, ONE source-over', (i) => {
+      fillShade(i, vis2d.ctx);
+      batchKey(kBand);
+      clear2d(fogA.ctx, null); emitWith(fogA.ctx, palAlpha);
+      const v = vis2d.ctx;
+      v.globalCompositeOperation = 'source-over'; v.drawImage(fogA.c, 0, 0);
+    }],
+    ['W1  WebGL composites 2 textures', (i) => {
+      fillShade(i, vis2d.ctx);
+      batchKey(kBand); clear2d(fogc.ctx, '#000000'); emitWith(fogc.ctx, palD);
+      upload(texScene, vis2d.c);
+      upload(texFog, fogc.c);
+      gl.useProgram(pQuad);
+      gl.disable(gl.DEPTH_TEST);
+      gl.viewport(0, 0, W, H);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texScene);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texFog);
+      gl.uniform1i(gl.getUniformLocation(pQuad, 'uScene'), 0);
+      gl.uniform1i(gl.getUniformLocation(pQuad, 'uFog'), 1);
+      gl.uniform3f(gl.getUniformLocation(pQuad, 'uFogColor'), FOG[0], FOG[1], FOG[2]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+      const a = gl.getAttribLocation(pQuad, 'aP');
+      gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }],
+    ['W2  WebGL rasterises fog from geometry', (i) => {
+      fillShade(i, vis2d.ctx);                    // NO fog geometry pass at all
+      upload(texScene, vis2d.c);
+      const nv = packGeom();
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, posArr.subarray(0, nv * 2));
+      gl.bindBuffer(gl.ARRAY_BUFFER, iwBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, iwArr.subarray(0, nv));
+      gl.useProgram(pGeom);
+      gl.viewport(0, 0, W, H);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+      gl.clearColor(FOG[0], FOG[1], FOG[2], 1); gl.clearDepth(1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texScene);
+      gl.uniform1i(gl.getUniformLocation(pGeom, 'uScene'), 0);
+      gl.uniform3f(gl.getUniformLocation(pGeom, 'uFogColor'), FOG[0], FOG[1], FOG[2]);
+      gl.uniform2f(gl.getUniformLocation(pGeom, 'uRes'), W, H);
+      gl.uniform2f(gl.getUniformLocation(pGeom, 'uZ'), zmin, zmax);
+      const ap = gl.getAttribLocation(pGeom, 'aP'), ai = gl.getAttribLocation(pGeom, 'aIW');
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.enableVertexAttribArray(ap); gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, iwBuf);
+      gl.enableVertexAttribArray(ai); gl.vertexAttribPointer(ai, 1, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, nv);
+    }],
+    ['--  fill + shade only (no fog)', (i) => { fillShade(i, vis2d.ctx); }],
+    ['--  upload cost alone (1 texture)', (i) => { fillShade(i, vis2d.ctx); upload(texScene, vis2d.c); }]
+  ];
+
+  // ---- does the ALPHA single-op version match the two-op reference? -----
+  // Alpha composites rather than replaces, so two bands that overlap in screen
+  // space -- which happens exactly where the surface self-occludes -- give
+  // d_near + d_far*(1-d_near) instead of d_near.  Bounded (always OVER-fogged),
+  // but it has to be measured, not assumed.  One getImageData, outside the
+  // timing loop, on throwaway canvases.
+  function validateAlpha() {
+    const ref = mk2d(W, H), tst = mk2d(W, H);
+    build(3);
+    emit(fill.ctx, kMat, palMat, FOGHEX);
+    emit(shade.ctx, kSh, palSh, '#ffffff');
+    for (const t of [ref.ctx, tst.ctx]) {
+      t.globalCompositeOperation = 'copy'; t.drawImage(fill.c, 0, 0);
+      t.globalCompositeOperation = 'multiply'; t.drawImage(shade.c, 0, 0);
+      t.globalCompositeOperation = 'source-over';
+    }
+    batchKey(kBand);
+    clear2d(fogc.ctx, '#ffffff'); emitWith(fogc.ctx, palKeep);
+    clear2d(fogAdd.ctx, '#000000'); emitWith(fogAdd.ctx, palAdd);
+    ref.ctx.globalCompositeOperation = 'multiply'; ref.ctx.drawImage(fogc.c, 0, 0);
+    ref.ctx.globalCompositeOperation = 'lighter'; ref.ctx.drawImage(fogAdd.c, 0, 0);
+    clear2d(fogA.ctx, null); emitWith(fogA.ctx, palAlpha);
+    tst.ctx.globalCompositeOperation = 'source-over'; tst.ctx.drawImage(fogA.c, 0, 0);
+    const a = ref.ctx.getImageData(0, 0, W, H).data;
+    const b = tst.ctx.getImageData(0, 0, W, H).data;
+    let n = 0, g8 = 0, g16 = 0, mx = 0, sum = 0;
+    for (let p = 0; p < a.length; p += 4) {
+      const d = Math.max(Math.abs(a[p] - b[p]), Math.abs(a[p + 1] - b[p + 1]), Math.abs(a[p + 2] - b[p + 2]));
+      if (d > 0) n++;
+      if (d > 8) g8++;
+      if (d > 16) g16++;
+      if (d > mx) mx = d;
+      sum += d;
+    }
+    const tot = W * H;
+    return { anyPct: +(100 * n / tot).toFixed(3), gt8Pct: +(100 * g8 / tot).toFixed(3),
+             gt16Pct: +(100 * g16 / tot).toFixed(3), maxDelta: mx,
+             mae: +(sum / tot).toFixed(3) };
+  }
+
+  log('fog on WebGL -- ' + TAG + '   ' + W + 'x' + H + ', ' + scene.nVis + ' visible faces');
+  log('canvas2d keeps the fill and shade passes in every case.');
+  log('');
+  const av = validateAlpha();
+  results.alphaError = av;
+  log('A1 (alpha, one op) against B2 (two ops, exact): ' + av.anyPct + ' % of pixels differ, ' +
+      av.gt8Pct + ' % by >8, ' + av.gt16Pct + ' % by >16, max ' + av.maxDelta + ', MAE ' + av.mae);
+  log('');
+  log('  ' + pd('case', 40) + rp('frameMs', 9) + rp('cpuMs', 9) + rp('vs C0', 8) + '   frames 1-14');
+  let base = 0;
+  for (const [name, body] of cases) {
+    statusEl.textContent = name;
+    let r;
+    try { r = await sustained(body, FRAMES); }
+    catch (e) { log('  ' + pd(name, 40) + '  ERROR ' + e.message); continue; }
+    if (base === 0) base = r.frameMs;
+    log('  ' + pd(name, 40) + rp(r.frameMs.toFixed(1), 9) + rp(r.cpuMs.toFixed(1), 9) +
+      rp((r.frameMs / base).toFixed(2) + 'x', 8) + '   ' + r.trace.join(' '));
+    results.cases.push({ name, frameMs: +r.frameMs.toFixed(2), cpuMs: +r.cpuMs.toFixed(2),
+                         vsC0: +(r.frameMs / base).toFixed(3), trace: r.trace });
+    await new Promise(z => setTimeout(z, 120));
+  }
+  results.micro = [{ note: 'webgl fog probe', cases: results.cases.length }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(results)
+  }).catch(() => { });
+})();
+</script>

@@ -1,0 +1,105 @@
+<meta charset="utf-8">
+<title>textured triangle batching</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+  canvas.pv { border:1px solid #333; width:320px; height:200px; }
+</style>
+<div id="status">booting…</div>
+<div id="previews"></div>
+<pre id="out"></pre>
+<script src="harness.js"></script>
+<script src="texture.js"></script>
+<script>
+'use strict';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'tex';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const raf = () => new Promise(r => requestAnimationFrame(r));
+const CW = 1040, CH = 660;
+
+function minRounds(f, rounds, iters) {
+  let best = Infinity;
+  for (let r = 0; r < rounds; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) f();
+    const ms = (performance.now() - t0) / iters;
+    if (ms < best) best = ms;
+  }
+  return best;
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }), 5000);
+  const RES = { env: { tag: TAG, ua: navigator.userAgent }, scenes: [], micro: [], notes: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent);
+  log('\n' + TRIS + ' textured triangles (' + QUADS + ' quads), 256x256 texture, ' + CW + 'x' + CH + '\n');
+
+  const gpu = mkCanvas(CW, CH, { alpha: false });
+  const cpu = mkCanvas(CW, CH, { alpha: false, willReadFrequently: true });
+
+  // correctness: does the pattern recipe match the clip recipe?
+  const refName = 'tex: clip + drawImage  per tri';
+  const A = mkCanvas(CW, CH, { alpha: false, willReadFrequently: true });
+  clear(A.ctx, CW, CH); TEXMICRO[refName](A.ctx);
+  const refData = A.ctx.getImageData(0, 0, CW, CH).data;
+
+  log(pad('case', 40) + rp('recMs', 9) + rp('rasterMs', 11) + rp('vs clip', 9) + '   pixels!=clip (>8)');
+  const names = Object.keys(TEXMICRO);
+  let clipRec = 0, clipRas = 0;
+  for (const k of names) {
+    statusEl.textContent = k;
+    await raf();
+    const f = TEXMICRO[k];
+    for (let i = 0; i < 3; i++) { clear(gpu.ctx, CW, CH); f(gpu.ctx); }
+    const rec = minRounds(() => { clear(gpu.ctx, CW, CH); f(gpu.ctx); }, 4, 4);
+    await raf();
+    for (let i = 0; i < 2; i++) { clear(cpu.ctx, CW, CH); f(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }
+    const ras = minRounds(() => { clear(cpu.ctx, CW, CH); f(cpu.ctx); cpu.ctx.getImageData(0, 0, 1, 1); }, 3, 2);
+    if (!clipRec) { clipRec = rec; clipRas = ras; }
+
+    // pixel comparison against the clip+drawImage reference
+    const B = mkCanvas(CW, CH, { alpha: false, willReadFrequently: true });
+    clear(B.ctx, CW, CH); f(B.ctx);
+    const d = B.ctx.getImageData(0, 0, CW, CH).data;
+    let g8 = 0, mx = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      const e = Math.max(Math.abs(d[i] - refData[i]), Math.abs(d[i + 1] - refData[i + 1]), Math.abs(d[i + 2] - refData[i + 2]));
+      if (e > 8) g8++;
+      if (e > mx) mx = e;
+    }
+    B.c.width = B.c.height = 1;
+    const pct = (100 * g8 / (CW * CH)).toFixed(3);
+
+    RES.notes.push({ name: k, recMs: +rec.toFixed(3), rasterMs: +ras.toFixed(3), diffPct: +pct, maxDelta: mx });
+    log(pad(k, 40) + rp(rec.toFixed(3), 9) + rp(ras.toFixed(2), 11) +
+        rp((ras / clipRas).toFixed(2) + 'x', 9) + rp(pct + '%', 12) + rp('max' + mx, 7));
+  }
+
+  // visual previews so the warping is visible, not just tabulated
+  const pv = document.getElementById('previews');
+  for (const k of ['tex: clip + drawImage  per tri', 'tex: pattern fill  per tri',
+                   'tex: pattern fill  per QUAD (2 tri)', 'tex: pattern 1 fill TOTAL (CEILING)']) {
+    const c = mkCanvas(CW, CH, { alpha: false });
+    c.c.className = 'pv';
+    clear(c.ctx, CW, CH); TEXMICRO[k](c.ctx);
+    const lab = document.createElement('div');
+    lab.textContent = k;
+    pv.appendChild(lab); pv.appendChild(c.c);
+  }
+
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'complete', recMs: 0, rasterMs: 0 });
+  await post(TAG, RES);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>

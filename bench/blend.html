@@ -1,0 +1,293 @@
+<meta charset="utf-8">
+<title>source-over vs destination-over</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script src="harness.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Hypothesis under test: destination-over drawn FRONT-TO-BACK might let the
+// engine skip already-covered pixels, the way a z-buffer early-outs.
+//
+// What has to be measured honestly:
+//   * destination-over is a no-op on an alpha:false canvas -- the destination
+//     alpha is already 1 everywhere, so `dst + (1-da)*src` adds nothing.  It
+//     therefore FORCES alpha:true, which is itself a measured 3.6x record-cost
+//     penalty on Firefox.  So the comparison must separate the cost of
+//     alpha:true from the cost of the blend mode.
+//   * source-over with an OPAQUE source is the cheapest blend there is: the
+//     engine can skip reading the destination entirely.  destination-over can
+//     never do that -- it is defined in terms of the destination.
+//   * if there is an early-out it should show up as sub-linear scaling with
+//     overdraw, so overdraw is swept.
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'blend';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const pad = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const raf = () => new Promise(r => requestAnimationFrame(r));
+
+function angleFn(i) { const a = i * 0.021; return [a * 0.7 + 0.4, a, a * 0.31, 3.1, 620]; }
+function reverseOrder(s) {
+  const o = s.order;
+  for (let i = 0, j = s.nVis - 1; i < j; i++, j--) { const t = o[i]; o[i] = o[j]; o[j] = t; }
+}
+
+// --- the six scene contenders ----------------------------------------------
+// Each one owns its own clearing, because the two modes need opposite setups.
+function perTri(R, ctx, st) { ctx.lineWidth = 0.5; STRATEGIES.triStroke(R, ctx, st); }
+function batched(R, ctx, st) { ctx.lineWidth = 0.5; R.setTile(2); R.batchGridExact(); R.emitBoundary(ctx, st, true, 1); }
+
+function srcOver(draw) {
+  return (R, ctx, st) => {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    draw(R, ctx, st);
+  };
+}
+function dstOver(draw) {
+  return (R, ctx, st) => {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, W, H);                 // transparent, so dst-over shows
+    ctx.globalCompositeOperation = 'destination-over';
+    reverseOrder(R.s);                          // front-to-back: first drawn wins
+    draw(R, ctx, st);
+    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);   // background lands behind
+    ctx.globalCompositeOperation = 'source-over';
+  };
+}
+
+const CASES = [
+  ['per-tri  srcOver  alpha:false', srcOver(perTri), false],
+  ['per-tri  srcOver  alpha:TRUE ', srcOver(perTri), true],
+  ['per-tri  dstOver  alpha:TRUE ', dstOver(perTri), true],
+  ['batched  srcOver  alpha:false', srcOver(batched), false],
+  ['batched  srcOver  alpha:TRUE ', srcOver(batched), true],
+  ['batched  dstOver  alpha:TRUE ', dstOver(batched), true],
+  ['batched  dstOver  strokeFirst ', (R, c, st) => { R.strokeFirst = true; dstOver(batched)(R, c, st); R.strokeFirst = false; }, true]
+];
+
+function sustained(fn, R, ctx, reps, frames) {
+  return new Promise(resolve => {
+    const s = R.s, st = new Stats();
+    let i = 0, warm = 6, t0 = 0, n = 0, cpu = 0, done = false;
+    const wd = setTimeout(() => { if (!done) { done = true; resolve(null); } }, 120000);
+    function step(ts) {
+      if (done) return;
+      if (warm > 0) { warm--; if (warm === 0) { t0 = ts; n = 0; cpu = 0; } }
+      const a = angleFn(i++);
+      s.build(a[0], a[1], a[2], a[3], a[4]);
+      st.reset();
+      const c0 = performance.now();
+      for (let r = 0; r < reps; r++) fn(R, ctx, st);
+      if (warm === 0) { cpu += performance.now() - c0; n++; }
+      if (warm === 0 && n >= frames) {
+        done = true; clearTimeout(wd);
+        resolve({ per: (ts - t0) / (n * reps), cpu: cpu / (n * reps), st });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+// --- overdraw sweep: does either mode scale sub-linearly? -------------------
+function overdrawCase(mode, layers) {
+  const n = 6000, xs = new Float32Array(n * 6);
+  let sd = 7 >>> 0;
+  const rnd = () => ((sd = (sd * 1664525 + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < n; i++) {
+    const cx = rnd() * 900 + 40, cy = rnd() * 500 + 40;
+    xs[i * 6] = cx; xs[i * 6 + 1] = cy;
+    xs[i * 6 + 2] = cx + 120; xs[i * 6 + 3] = cy + 30;
+    xs[i * 6 + 4] = cx + 40; xs[i * 6 + 5] = cy + 120;
+  }
+  const pal = [];
+  for (let i = 0; i < 32; i++) pal.push('#' + ((i * 517 + 0x204060) & 0xffffff).toString(16).padStart(6, '0'));
+  return function (ctx) {
+    if (mode === 'src') {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = BG; ctx.fillRect(0, 0, 1024, 640);
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.clearRect(0, 0, 1024, 640);
+      ctx.globalCompositeOperation = 'destination-over';
+    }
+    for (let L = 0; L < layers; L++) {
+      for (let i = 0; i < n / layers; i++) {
+        const o = ((i + L * 977) % n) * 6;
+        ctx.fillStyle = pal[(i + L) & 31];
+        ctx.beginPath();
+        ctx.moveTo(xs[o], xs[o + 1]); ctx.lineTo(xs[o + 2], xs[o + 3]); ctx.lineTo(xs[o + 4], xs[o + 5]);
+        ctx.fill();
+      }
+    }
+    if (mode === 'dst') { ctx.fillStyle = BG; ctx.fillRect(0, 0, 1024, 640); }
+    ctx.globalCompositeOperation = 'source-over';
+  };
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => { }), 5000);
+  // micro[] doubles as the runner's completion signal, so it stays empty
+  // until the very end; findings accumulate in `notes`.
+  const RES = { env: { tag: TAG, ua: navigator.userAgent }, scenes: [], micro: [], notes: [] };
+  log('TAG ' + TAG + '\n' + navigator.userAgent + '\n');
+
+  // 0. does destination-over even do anything on an opaque canvas?
+  {
+    const c = mkCanvas(64, 64, { alpha: false });
+    c.ctx.fillStyle = '#000'; c.ctx.fillRect(0, 0, 64, 64);
+    c.ctx.globalCompositeOperation = 'destination-over';
+    c.ctx.fillStyle = '#ff0000'; c.ctx.fillRect(0, 0, 64, 64);
+    const px = c.ctx.getImageData(32, 32, 1, 1).data;
+    const nop = px[0] === 0 && px[1] === 0 && px[2] === 0;
+    log('sanity: destination-over on an alpha:false canvas is ' +
+        (nop ? 'a NO-OP (draws nothing), as expected' : 'VISIBLE -- unexpected!') +
+        '  [rgb ' + px[0] + ',' + px[1] + ',' + px[2] + ']');
+    RES.notes.push({ name: 'dstOver on alpha:false is a no-op', recMs: nop ? 1 : 0, rasterMs: null });
+  }
+
+  const mesh = makeTorusKnot(512, 64, 3, 7, 8);
+  const scene = new Scene(mesh, W, H, 24, 8);
+  const R = new Renderer(scene, 2);
+  scene.build.apply(scene, angleFn(0));
+  log('\ntorusKnot, ' + scene.nVis + ' visible triangles, stroking on (lineWidth 0.5)\n');
+
+  // 1. equivalence: does dstOver front-to-back give the same picture?
+  let eqLabel = '';
+  for (const strokeFirst of [false, true]) {
+    eqLabel = strokeFirst ? 'stroke-first' : 'fill-first';
+    const A = mkCanvas(W, H, { alpha: false, willReadFrequently: true });
+    const B = mkCanvas(W, H, { alpha: true, willReadFrequently: true });
+    R.strokeFirst = false;
+    scene.build.apply(scene, angleFn(7));
+    srcOver(batched)(R, A.ctx, new Stats());
+    R.strokeFirst = strokeFirst;
+    scene.build.apply(scene, angleFn(7));
+    dstOver(batched)(R, B.ctx, new Stats());
+    R.strokeFirst = false;
+    const da = A.ctx.getImageData(0, 0, W, H).data, db = B.ctx.getImageData(0, 0, W, H).data;
+    let diff = 0, g8 = 0, mx = 0;
+    for (let i = 0; i < da.length; i += 4) {
+      const d = Math.max(Math.abs(da[i] - db[i]), Math.abs(da[i + 1] - db[i + 1]), Math.abs(da[i + 2] - db[i + 2]));
+      if (d > 0) diff++;
+      if (d > 8) g8++;
+      if (d > mx) mx = d;
+    }
+    log('equivalence (batched srcOver back-to-front  vs  dstOver front-to-back):');
+    log('  pixels differing: ' + (100 * diff / (W * H)).toFixed(3) + '%   >8: ' +
+        (100 * g8 / (W * H)).toFixed(3) + '%   maxDelta: ' + mx + '\n');
+    RES.notes.push({ name: 'equivalence ' + eqLabel + ' >8 pct', recMs: +(100 * g8 / (W * H)).toFixed(4), rasterMs: mx });
+  }
+
+  // 2. sustained, GPU-inclusive
+  log(pad('case', 32) + rp('fills', 7) + rp('strk', 7) + rp('reps', 6) +
+      rp('perDraw', 10) + rp('cpu', 9) + rp('hidden', 9) + rp('vs base', 9));
+  const rec = { name: 'torusKnot blend modes', nVis: scene.nVis, rows: [] };
+  let baseline = 0;
+  for (const [label, fn, alpha] of CASES) {
+    statusEl.textContent = label;
+    const cv = mkCanvas(W, H, { alpha });
+    cv.c.style.cssText = 'position:fixed;left:8px;bottom:8px;width:256px;height:144px';
+    document.body.appendChild(cv.c);
+    await raf();
+    const probe = runPass(fn, R, cv.ctx, W, H, angleFn, 10, false);
+    const reps = Math.max(2, Math.min(48, Math.ceil(50 / Math.max(probe.ms, 0.4))));
+    const r = await sustained(fn, R, cv.ctx, reps, 30);
+    cv.c.remove(); cv.c.width = cv.c.height = 1;
+    if (!r) { log(pad(label, 32) + '  (throttled)'); continue; }
+    if (!baseline) baseline = r.per;
+    const row = { case: label, fills: probe.st.fills, strokes: probe.st.strokes, reps,
+      perDrawMs: +r.per.toFixed(3), cpuPerDrawMs: +r.cpu.toFixed(3),
+      gpuShareMs: +(r.per - r.cpu).toFixed(3) };
+    rec.rows.push(row);
+    log(pad(label, 32) + rp(row.fills, 7) + rp(row.strokes, 7) + rp(reps, 6) +
+        rp(row.perDrawMs, 10) + rp(row.cpuPerDrawMs, 9) + rp(row.gpuShareMs, 9) +
+        rp((r.per / baseline).toFixed(2) + 'x', 9));
+    await raf();
+  }
+  RES.scenes.push(rec);
+  await post(TAG, RES);
+
+  // 2b. the same cases with FORCED COMPLETION.  The rAF numbers above report
+  // hidden GPU time near zero for destination-over, which cannot be right for
+  // ~1000 non-convex fills -- so measure again on a canvas that must finish
+  // before getImageData returns.  This is the number to trust.
+  log('');
+  log('forced completion (willReadFrequently + 1px getImageData):');
+  log(pad('case', 32) + rp('ms', 9) + rp('vs base', 9));
+  let fbase = 0;
+  for (const [label, fn, alpha] of CASES) {
+    statusEl.textContent = 'forced: ' + label;
+    const cv = mkCanvas(W, H, { alpha, willReadFrequently: true });
+    await raf();
+    const r = runPass(fn, R, cv.ctx, W, H, angleFn, 8, true);
+    cv.c.width = cv.c.height = 1;
+    if (!fbase) fbase = r.ms;
+    RES.notes.push({ name: 'forced ' + label, recMs: +r.ms.toFixed(2), rasterMs: null });
+    log(pad(label, 32) + rp(r.ms.toFixed(2), 9) + rp((r.ms / fbase).toFixed(2) + 'x', 9));
+    await raf();
+  }
+  await post(TAG, RES);
+
+  // 3. overdraw sweep -- an early-out would show as sub-linear scaling
+  log('\noverdraw sweep: 6000 large triangles split into N layers, 1024x640');
+  log('(total fills constant, so flat = no penalty; an early-out would make dst FALL)');
+  log(pad('layers', 8) + rp('srcOver rec', 13) + rp('raster', 9) +
+      rp('dstOver rec', 13) + rp('raster', 9) + rp('dst/src raster', 16));
+  const og = mkCanvas(1024, 640, { alpha: false });
+  const oa = mkCanvas(1024, 640, { alpha: true });
+  const ocs = mkCanvas(1024, 640, { alpha: false, willReadFrequently: true });
+  const oca = mkCanvas(1024, 640, { alpha: true, willReadFrequently: true });
+  const minR = (f, rounds, iters) => {
+    let best = Infinity;
+    for (let r = 0; r < rounds; r++) {
+      const t0 = performance.now();
+      for (let i = 0; i < iters; i++) f();
+      const ms = (performance.now() - t0) / iters;
+      if (ms < best) best = ms;
+    }
+    return best;
+  };
+  for (const layers of [1, 2, 4, 8]) {
+    statusEl.textContent = 'overdraw x' + layers;
+    const fs = overdrawCase('src', layers), fd = overdrawCase('dst', layers);
+    for (let i = 0; i < 3; i++) { fs(og.ctx); fd(oa.ctx); }
+    await raf();
+    const sr = minR(() => fs(og.ctx), 4, 4);
+    const dr = minR(() => fd(oa.ctx), 4, 4);
+    for (let i = 0; i < 2; i++) { fs(ocs.ctx); ocs.ctx.getImageData(0, 0, 1, 1); fd(oca.ctx); oca.ctx.getImageData(0, 0, 1, 1); }
+    const sc = minR(() => { fs(ocs.ctx); ocs.ctx.getImageData(0, 0, 1, 1); }, 3, 2);
+    const dc = minR(() => { fd(oca.ctx); oca.ctx.getImageData(0, 0, 1, 1); }, 3, 2);
+    RES.notes.push({ name: 'overdraw x' + layers + ' srcOver', recMs: +sr.toFixed(3), rasterMs: +sc.toFixed(3) });
+    RES.notes.push({ name: 'overdraw x' + layers + ' dstOver', recMs: +dr.toFixed(3), rasterMs: +dc.toFixed(3) });
+    log(pad('x' + layers, 8) + rp(sr.toFixed(2), 13) + rp(sc.toFixed(2), 9) +
+        rp(dr.toFixed(2), 13) + rp(dc.toFixed(2), 9) + rp((dc / sc).toFixed(2) + 'x', 16));
+    await raf();
+  }
+
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'complete', recMs: 0, rasterMs: 0 });
+  await post(TAG, RES);
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  post(TAG, { error: String(e), micro: [{}] });
+}), 120));
+</script>
