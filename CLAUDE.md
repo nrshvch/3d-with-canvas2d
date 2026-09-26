@@ -23,7 +23,7 @@ it. Every rule here exists to make that failure visible.
 The canonical version and date live on **line 3** of the guide:
 
 ```markdown
-**Version 1.10 · circa September 2026**
+**Version 1.61 · circa September 2026**
 ```
 
 **Update both on every substantive change, in the same edit as the change.**
@@ -117,7 +117,26 @@ A change to one section usually owes edits elsewhere. Check all of these:
 
 - [ ] **Version + circa date** on line 3 (rule 1).
 - [ ] **Contents** — the `## Contents` list carries every `##`/`###` heading with
-      a GitHub-style anchor. A new subsection needs a line there.
+      a GitHub-style anchor. A new subsection needs a line there, and a
+      *renamed* heading needs its line rewritten: the anchor changes with the
+      title, and a stale anchor fails silently on GitHub.
+- [ ] **Figures** — every new numbered section, and every new `####` topic that
+      carries a measurement or a mechanism, has a generated figure placed in
+      it (rule 5), with a caption that names the script and the `T` id. A
+      section that genuinely needs none says so to yourself, not to the
+      reader. Every file in `assets/` is referenced from `README.md` (no
+      orphans), and every new or changed figure has been rendered and looked
+      at — overlapping labels and clipped rows do not show in the SVG source.
+- [ ] **Reader-only content** — `README.md` is for its readers. It carries no
+      instructions for editing or updating the book (how to bump the version,
+      how to number a `T` entry, commit or branch procedure, checklists like
+      this one), no link or reference to `CLAUDE.md`, and no trace of the
+      conversation that produced a change — nothing addressed to the author
+      or requester ("you asked", "as requested", "the simplification you would
+      accept"), no handoff, session or agent talk. Process lives here.
+      Reader-facing facts about the document are fine: what a version number
+      means, where a superseded number is recorded, that a claim is
+      *field-reported*.
 - [ ] **Registry** — a `T` entry, and any new `S`/`C`/`A`/`M` fixture.
 - [ ] **Rules sections** — §1.4–§1.11 are the actionable distillate. A new
       finding that changes what someone should *do* belongs there too, not only
@@ -142,7 +161,19 @@ grep -o "T[0-9][0-9]*" README.md | sort -u -V | tail -5
 ```
 
 Also verify: every `![](assets/...)` path exists, every `](#anchor)` resolves to
-a heading, and no markdown table has a ragged row.
+a heading, and no markdown table has a ragged row. And the two checks behind
+the last two list items:
+
+```bash
+# figures: none orphaned (a missing one fails the ![](...) check above)
+for f in assets/*; do grep -q "$f" README.md || echo "unreferenced $f"; done
+# reader-only: editing procedure or conversation leaking into the book
+grep -n -i -E "CLAUDE\.md|you (asked|wanted|would accept)|as (you )?requested|hand-?off|the author|per the .* rule|next free T|pull request|git (commit|push)" README.md
+```
+
+Both should print nothing. Render a figure with the pre-installed Chromium
+to look at it: `chrome --headless --screenshot=out.png --window-size=640,1400
+file://$PWD/assets/<name>.svg`.
 
 ---
 
@@ -158,6 +189,14 @@ so a figure cannot drift from the algorithm it illustrates.
 - `bench/prepdiagrams.mjs` → `assets/prep-predicate.svg`,
   `prep-contiguity.svg`, `prep-backdrop.svg`
 - `bench/shots.mjs` + `bench/shotpage.html` → the rendered contact sheets
+- `bench/bandfigs.mjs` → `assets/band-junctions.svg` (the band's junction
+  cases, read out of `bench/pathshape.js`'s `bandLoop()`, every panel's
+  verdict computed by sampling)
+- `bench/tessfigs.mjs` → `assets/tess-shapes.svg`, `tess-budget.svg`,
+  `merge-or-split.svg`, `accel-vs-soft.svg` (Firefox's tessellators run live
+  through `bench/wgr.mjs`; timings read from the committed `bench/out/`
+  results; shapes from `pathshape.js`'s `tierShapes()` / `mergeLayouts()`, the
+  same geometry the page timed)
 
 One script per figure family, so re-running one cannot overwrite another. Keep
 the palette in `C` (it has to read on a light or a dark page), keep text as SVG

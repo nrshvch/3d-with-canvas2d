@@ -90,7 +90,8 @@ for (const [nm, mesh, sh, bd, ang] of cases) {
   };
   const mk = () => new PainterBatcher({
     width: W, height: H, triangleCount: mesh.nt, vertexCount: mesh.nv,
-    indices: mesh.idx, adjacency: mesh.adj, palette: scene.pal
+    indices: mesh.idx, adjacency: mesh.adj, palette: scene.pal,
+    seamBand: 0           // 4.9's numbers were taken on C1, the seam stroke; the default is the band since v1.30
   });
   const occ = new Occluder({
     width: W, height: H, triangleCount: mesh.nt,

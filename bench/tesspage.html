@@ -1,0 +1,917 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tessellation: what each path shape costs</title>
+<style>body{background:#111;color:#ccc;font:12px monospace;margin:8px}pre{white-space:pre}</style>
+<div id="status">loading</div><pre id="out"></pre>
+<script src="mesh.js"></script>
+<script src="scene.js"></script>
+<script src="render.js"></script>
+<script type="module">
+// ---------------------------------------------------------------------------
+// tesspage.html -- the timing and fidelity side of bench/tess.mjs (4.12).
+//
+// Same faces, same colours, same batch assignment; only the cut into fill()
+// calls and subpaths varies (bench/pathshape.js).  Parts, via ?parts=:
+//
+//   C  the Firefox cliff, re-derived: isopage P7's exact paths, with this
+//      page running Firefox's own tessellator (bench/wgr.mjs) over them, so
+//      the verdict (A7) and the tessellated bytes (A9) are for the SAME paths
+//   T  strategies x scenes: raster (A3), sustained with the scene animated
+//      so no path cache can hit (A2), main-thread CPU, WGR bytes (A9),
+//      and the A7 verdict where the indicator is on
+//   B  the band's junction fixes: pixel diffs against the unfixed band and
+//      the gap against a 4x union reference (A5), on a CPU-raster canvas
+//   S  the Skia tiers in isolation: one path, same area, convex / concave /
+//      self-crossing / many subpaths (A3)
+//   G  the same shapes on the page's GPU canvas, sustained (A2), plus the 16
+//      hexagons as 16 separate fill() calls -- the case Ganesh can merge
+//      (on a Graphite build, chrome://gpu's Skia Backend, it is Graphite's)
+//   N  the field report's "20 000 small faces / 60 000 verts": 20 000 separate
+//      triangle fills at several sizes, A9 count, A7 verdict still and
+//      animated, A2 still
+//   O  when to merge same-colour polygons into one fill(): 16 shapes disjoint
+//      (close, spread, tiny), touching (shared edges left in, and cancelled),
+//      lightly and heavily overlapping, and ONE overlapping pair (as one path,
+//      two fills, and its union outline) -- A3 + A2 + A9, and the pixels the
+//      cuts disagree on
+//
+// ?still=1 holds part T's scene still (paths repeat, Firefox's path cache can
+// hit); the default rotates it every draw so no cache can.
+// ---------------------------------------------------------------------------
+import { PainterBatcher } from '/src/painter2d.js';
+import { STRATS as STRAT_ROWS, BAND_W, makeX, runStrategy, fieldLoad, tierShapes, mergeLayouts } from './pathshape.js';
+import { WgrContext, pathBufferVerts, bufferVerts, uniqBufferVerts, aaStroke } from './wgr.mjs';
+
+const W = 1280, H = 720, BG = '#101014';
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'tess';
+const QUICK = Q.get('quick') === '1';
+const PARTS = (Q.get('parts') || 'C,D,S,T,B').split(',');
+const BUF_MB = +(Q.get('bufmb') || 4);           // what the profile set gpu-path-size to
+const STILL = Q.get('still') === '1';
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => String(s).padStart(n), pd = (s, n) => String(s).padEnd(n);
+const results = { tag: TAG, micro: [], env: {}, cliff: [], strat: [], band: [], tiers: [], demote: [], frag: [], strokeBudget: [],
+                  gpuTiers: [], field: [], overlap: [] };
+const nextFrame = () => new Promise(r => requestAnimationFrame(r));
+let wcShared = null;
+const WC = () => { if (!wcShared) wcShared = new WgrContext(1 << 23, W, H); wcShared.reset(); return wcShared; };
+
+function mk(w, h, opts) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.style.cssText = 'position:absolute;left:-4000px;top:0';
+  document.body.appendChild(c);
+  return { c, ctx: c.getContext('2d', opts || { alpha: false }) };
+}
+
+// --- A7: Gecko's acceleration indicator ------------------------------------
+let probe = null, INDICATOR = false;
+function accelFraction(canvas) {
+  if (!probe) probe = mk(32, 32, { alpha: false, willReadFrequently: true });
+  const p = probe.ctx;
+  p.fillStyle = '#000'; p.fillRect(0, 0, 32, 32);
+  p.drawImage(canvas, canvas.width - 16, 0, 16, 16, 0, 0, 16, 16);
+  const d = p.getImageData(3, 3, 10, 10).data;
+  let g = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) { n++; if (d[i] < 60 && d[i + 1] > 190 && d[i + 2] < 60) g++; }
+  return g / n;
+}
+const verdict = (c) => !INDICATOR ? '-' : accelFraction(c) > 0.8 ? 'ACCEL' : 'soft';
+
+// --- A2: sustained, total wall / frames ------------------------------------
+function sustained(fn, frames) {
+  return new Promise(resolve => {
+    let warm = 4, t0 = 0, n = 0, cpu = 0;
+    const cpus = [];
+    function step(ts) {
+      if (warm > 0) { warm--; fn(); if (warm === 0) t0 = performance.now(); requestAnimationFrame(step); return; }
+      const c0 = performance.now(); fn(); const c = performance.now() - c0;
+      cpu += c; cpus.push(c); n++;
+      if (n >= frames) {
+        resolve({ perFrame: (performance.now() - t0) / n, cpu: cpu / n, cpus });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+// ... and the version 8.1 actually prescribes, which parts T, G and N use.
+// The one above draws once per rAF, which reads vsync as soon as a draw is
+// shorter than a frame -- harmless on M4, where no draw was, and wrong on a
+// GPU.  Here: a DISPLAYED canvas (composited, so its GPU work is on the frame's
+// critical path), `reps` whole draws per callback with reps calibrated so one
+// callback is >= 50 ms of CPU, `warm` callbacks first (12 > Firefox's 10
+// profiled frames, so the A7 verdict is settled before the clock starts), and
+// wall time from the first timed callback to the start of the one after the
+// last, over callbacks x reps.
+function mkShown() {
+  const t = mk(W, H);
+  t.c.style.cssText = 'position:fixed;right:8px;bottom:8px;width:320px;height:180px;outline:1px solid #333';
+  return t;
+}
+function sustainedReps(fn, callbacks, warm = 12) {
+  let probe = Infinity;
+  for (let i = 0; i < 2; i++) { const c0 = performance.now(); fn(); probe = Math.min(probe, performance.now() - c0); }
+  const reps = Math.max(1, Math.min(64, Math.ceil(50 / Math.max(probe, 0.2))));
+  return new Promise(resolve => {
+    let n = -warm, t0 = 0, cpu = 0;
+    function step() {
+      const now = performance.now();
+      if (n === 0) t0 = now;
+      if (n === callbacks) { resolve({ perDraw: (now - t0) / (callbacks * reps), cpu: cpu / (callbacks * reps), reps }); return; }
+      const c0 = performance.now();
+      for (let r = 0; r < reps; r++) fn();
+      if (n >= 0) cpu += performance.now() - c0;
+      n++;
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+// A no-op canvas: the batcher's own JS with no draw call anywhere (A8), so the
+// difference against the same run into a WgrContext is WGR's own time.
+const INERT = { beginPath() {}, moveTo() {}, lineTo() {}, closePath() {}, fill() {}, stroke() {}, fillRect() {},
+                fillStyle: '', strokeStyle: '', lineWidth: 1 };
+// A command list: the frame's canvas calls recorded once, replayed as many
+// times as the timer wants.  Replaying K different recorded frames keeps every
+// path novel while taking the batcher's own JS out of the frame -- which on a
+// GPU is most of the main thread, and hides whatever the GPU costs behind it.
+// A replayed frame is the canvas cost alone: calls + record + raster.
+class RecCtx {
+  constructor() { this.a = new Float32Array(1 << 20); this.n = 0; this.styles = []; this.sIdx = new Map(); }
+  g(k) { if (this.n + k > this.a.length) { const b = new Float32Array(this.a.length * 2); b.set(this.a); this.a = b; } }
+  s(v) { let i = this.sIdx.get(v); if (i === undefined) { i = this.styles.length; this.styles.push(v); this.sIdx.set(v, i); } return i; }
+  beginPath() { this.g(1); this.a[this.n++] = 0; }
+  moveTo(x, y) { this.g(3); const a = this.a; a[this.n++] = 1; a[this.n++] = x; a[this.n++] = y; }
+  lineTo(x, y) { this.g(3); const a = this.a; a[this.n++] = 2; a[this.n++] = x; a[this.n++] = y; }
+  fill() { this.g(1); this.a[this.n++] = 3; }
+  stroke() { this.g(1); this.a[this.n++] = 4; }
+  closePath() { this.g(1); this.a[this.n++] = 8; }
+  fillRect(x, y, w, h) { this.g(5); const a = this.a; a[this.n++] = 9; a[this.n++] = x; a[this.n++] = y; a[this.n++] = w; a[this.n++] = h; }
+  set fillStyle(v) { this.g(2); this.a[this.n++] = 5; this.a[this.n++] = this.s(v); } get fillStyle() { return ''; }
+  set strokeStyle(v) { this.g(2); this.a[this.n++] = 6; this.a[this.n++] = this.s(v); } get strokeStyle() { return ''; }
+  set lineWidth(v) { this.g(2); this.a[this.n++] = 7; this.a[this.n++] = v; } get lineWidth() { return 1; }
+  take() { return { ops: this.a.slice(0, this.n), styles: this.styles.slice() }; }
+}
+function replay(R, c) {
+  const a = R.ops, st = R.styles, n = a.length;
+  for (let i = 0; i < n;) {
+    switch (a[i]) {
+      case 0: c.beginPath(); i += 1; break;
+      case 1: c.moveTo(a[i + 1], a[i + 2]); i += 3; break;
+      case 2: c.lineTo(a[i + 1], a[i + 2]); i += 3; break;
+      case 3: c.fill(); i += 1; break;
+      case 4: c.stroke(); i += 1; break;
+      case 5: c.fillStyle = st[a[i + 1]]; i += 2; break;
+      case 6: c.strokeStyle = st[a[i + 1]]; i += 2; break;
+      case 7: c.lineWidth = a[i + 1]; i += 2; break;
+      case 8: c.closePath(); i += 1; break;
+      case 9: c.fillRect(a[i + 1], a[i + 2], a[i + 3], a[i + 4]); i += 5; break;
+      default: throw new Error('bad op ' + a[i]);
+    }
+  }
+}
+const REPLAY_K = 8;
+const mean = (a, i0, i1) => { let s = 0, k = 0; for (let i = Math.max(0, i0); i < Math.min(a.length, i1); i++) { s += a[i]; k++; } return k ? s / k : 0; };
+
+// ===========================================================================
+// scenes and strategies -- identical to bench/tess.mjs
+// ===========================================================================
+const ANG = [0.4, 0.9, 0.13, 3.1, 620];
+const CASES = [
+  ['S1 torusKnot', () => makeTorusKnot(512, 64, 3, 7, 8), 24, 8],
+  ['S2 sphere', () => makeSphere(256, 128, 4), 24, 4],
+  ['S3 grid', () => makeGrid(180, 4), 24, 4]
+];
+const STRATS = STRAT_ROWS.map(r => r[0]).filter(n => !Q.get('strats') || Q.get('strats').split(',').includes(n));
+
+function setup(mk_, sh, bd) {
+  const mesh = mk_();
+  const scene = new Scene(mesh, W, H, sh, bd);
+  scene.build(ANG[0], ANG[1], ANG[2], ANG[3], ANG[4]);
+  const s = { order: scene.order, nVis: scene.nVis, colour: scene.col, sx: scene.sx, sy: scene.sy,
+              bx0: scene.bx0, by0: scene.by0, bx1: scene.bx1, by1: scene.by1 };
+  return makeX(PainterBatcher, mesh, scene, s, W, H);
+}
+function rebuild(X, animate) {
+  if (!animate) return;
+  // a small rotation per frame: every path is novel, as in a real 3D frame,
+  // while the counts barely move
+  const f = X.frame++;
+  X.scene.build(ANG[0], ANG[1], ANG[2] + 0.002 * (f % 50), ANG[3], ANG[4]);
+  X.s.nVis = X.scene.nVis;
+}
+function drawFrame(X, name, ctx, bg) {
+  ctx.fillStyle = bg || BG; ctx.fillRect(0, 0, W, H);
+  runStrategy(name, X, ctx);
+}
+// The clear for a timed, repeated draw.  On Chromium an opaque full-canvas
+// fillRect repeated inside one rAF callback costs 1.4-3.0x per draw once there
+// are 8 or more (part Z, T71) -- a real frame pays one -- so the repeat would
+// measure the clears.  At alpha 0.996 it is not charged that way, and the
+// picture is the same within 1/255.  (Mechanism unmeasured.  Skia does turn an
+// opaque full-target rect into a clear that deletes the ops before it --
+// OpsTask::resetForFullscreenClear -- but that predicts draws VANISHING, and
+// part Z shows them getting dearer.)
+const SUST_BG = 'rgba(16,16,20,0.996)';
+const drawFrameSus = (X, name, ctx) => drawFrame(X, name, ctx, SUST_BG);
+
+// ===========================================================================
+// C -- the cliff, with the tessellated bytes of the very paths drawn
+// ===========================================================================
+async function partC() {
+  statusEl.textContent = 'C cliff';
+  const SH = 24, MATS = 8;
+  const mesh = makeTorusKnot(512, 64, 3, 7, MATS);
+  const s = new Scene(mesh, W, H, SH, MATS);
+  s.build(0.4, 0.9, 0.13, 3.1, 620);
+  const R = new Renderer(s, 2);
+  const kMat = new Int32Array(mesh.nt);
+  for (let j = 0; j < s.nVis; j++) { const t = s.order[j]; kMat[t] = (s.col[t] / SH) | 0; }
+  const palA = [];
+  for (let m = 0; m < MATS; m++) palA.push('#' + ((1 << 24) + (((m * 29 + 40) & 255) << 16) +
+    (((m * 71 + 30) & 255) << 8) + ((m * 113 + 60) & 255)).toString(16).slice(1));
+  s.col = kMat; s.pal = palA; R.setTile(2); R.batchGridExact();
+  const nB0 = R.nB, ST = new Stats(), budget = pathBufferVerts(BUF_MB);
+  log(`C -- isopage P7's paths (S1, ${s.nVis} visible, ${nB0} batches), still.  gpu-path-size here: ${BUF_MB} MB = ${budget} WGR verts`);
+  log('  ' + pd('batches', 10) + rp('fills', 7) + rp('pathV', 8) + rp('WGR verts', 11) + rp('x buf', 7) +
+      rp('early', 8) + rp('late', 8) + rp('accel', 7));
+  const fr = QUICK ? [0.2, 0.5, 1.0] : [0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 1.0];
+  for (const f of fr) {
+    const nb = Math.max(1, Math.round(nB0 * f));
+    const fn = (ctx) => {
+      ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H); ctx.lineWidth = 0.5;
+      R.setTile(2); R.batchGridExact(); R.nB = nb; ST.reset();
+      R.emitBoundary(ctx, ST, true, 0);
+    };
+    const wc = WC(); fn(wc);
+    const fills = ST.fills, verts = ST.verts;
+    const t = mk(W, H);
+    const cpu = [];
+    for (let i = 0; i < (QUICK ? 40 : 70); i++) { const c0 = performance.now(); fn(t.ctx); cpu.push(performance.now() - c0); await nextFrame(); }
+    await nextFrame();
+    const v = verdict(t.c);
+    const e = mean(cpu, 3, 10), l = mean(cpu, cpu.length - 25, cpu.length);
+    log('  ' + pd(nb + '/' + nB0, 10) + rp(fills, 7) + rp(verts, 8) + rp(wc.verts, 11) +
+        rp((wc.verts / budget).toFixed(3), 7) + rp(e.toFixed(1), 8) + rp(l.toFixed(1), 8) + rp(v, 7));
+    results.cliff.push({ batches: nb, of: nB0, fills, pathVerts: verts, wgrVerts: wc.verts, uniqVerts: wc.uniqVerts,
+      wgrScans: wc.scans, bufMB: BUF_MB, ofBuffer: +(wc.verts / budget).toFixed(4),
+      early: +e.toFixed(2), late: +l.toFixed(2), verdict: v });
+    t.c.remove();
+    R.nB = nB0;
+  }
+  log('');
+}
+
+// ===========================================================================
+// T -- strategies x scenes
+// ===========================================================================
+async function partT() {
+  const callbacks = QUICK ? 10 : 30, reps = QUICK ? 2 : 5;
+  log('T -- strategies.  raster = A3 (willReadFrequently canvas + 1 px read, min of ' + reps + '),');
+  log('     frame = A2 per draw (8.1: displayed canvas, reps draws per rAF, >= 50 ms a callback), ' +
+      (STILL ? 'scene HELD STILL (paths repeat)' : 'scene rotating 0.002 rad per draw so every path is novel') + ',');
+  log('     cpu = main thread per draw; replay/r.cpu = the same, replaying ' + (STILL ? '1' : REPLAY_K) + ' recorded frame(s) (canvas calls only, no batcher JS);');
+  log('     wgr = Firefox 156 WGR+aa-stroke as wasm on this frame (A8-style, min of 3).');
+  for (const [nm, mk_, sh, bd] of CASES) {
+    const X = setup(mk_, sh, bd);
+    log(`  ${nm}: ${X.s.nVis} visible`);
+    log('    ' + pd('strategy', 19) + rp('fills', 7) + rp('pathV', 8) + rp('WGR MB', 8) +
+        rp('raster', 8) + rp('frame', 8) + rp('cpu', 8) + rp('reps', 5) + rp('replay', 8) + rp('r.cpu', 8) + rp('wgr', 7) + rp('accel', 7));
+    const rc = mk(W, H, { alpha: false, willReadFrequently: true });
+    if (!STILL) {
+      // the scene rebuild is inside every animated draw; price it on its own
+      const r0 = await sustainedReps(() => rebuild(X, true), callbacks);
+      log('    ' + pd('(rebuild only)', 19) + rp('', 31) + rp(r0.perDraw.toFixed(2), 8) + rp(r0.cpu.toFixed(2), 8) + rp(r0.reps, 5));
+      results.strat.push({ scene: nm, strategy: '(rebuild only)', perFrame: +r0.perDraw.toFixed(3), cpu: +r0.cpu.toFixed(3), reps: r0.reps, still: STILL });
+    }
+    for (const st of STRATS) {
+      statusEl.textContent = 'T ' + nm + ' ' + st;
+      // counts + WGR on the still frame
+      X.scene.build(ANG[0], ANG[1], ANG[2], ANG[3], ANG[4]); X.s.nVis = X.scene.nVis; X.frame = 0;
+      let tI = Infinity, tW = Infinity, wc = null;
+      for (let k = 0; k < 3; k++) {
+        let t0 = performance.now(); runStrategy(st, X, INERT); tI = Math.min(tI, performance.now() - t0);
+        wc = WC(); t0 = performance.now(); runStrategy(st, X, wc); tW = Math.min(tW, performance.now() - t0);
+      }
+      const fills = X.E.fills, pv = X.E.verts, wgrMs = Math.max(0, tW - tI);
+      // A3 raster
+      let best = Infinity;
+      for (let r = 0; r < reps; r++) {
+        const t0 = performance.now();
+        drawFrame(X, st, rc.ctx); rc.ctx.getImageData(0, 0, 1, 1);
+        const dt = performance.now() - t0; if (dt < best) best = dt;
+      }
+      // A2 sustained on a fresh displayed canvas
+      const t = mkShown();
+      const r = await sustainedReps(() => { rebuild(X, !STILL); drawFrameSus(X, st, t.ctx); }, callbacks);
+      await nextFrame();
+      const v = verdict(t.c);
+      t.c.remove();
+      // A2 again, replaying REPLAY_K recorded frames: the canvas cost without the batcher's JS
+      X.frame = 0;
+      const F = [];
+      for (let k = 0; k < (STILL ? 1 : REPLAY_K); k++) { rebuild(X, !STILL); const rec = new RecCtx(); drawFrameSus(X, st, rec); F.push(rec.take()); }
+      const t2 = mkShown();
+      let fk = 0;
+      const r2 = await sustainedReps(() => replay(F[fk++ % F.length], t2.ctx), callbacks);
+      await nextFrame();
+      const v2 = verdict(t2.c);
+      t2.c.remove();
+      X.scene.build(ANG[0], ANG[1], ANG[2], ANG[3], ANG[4]); X.s.nVis = X.scene.nVis; X.frame = 0;
+      log('    ' + pd(st, 19) + rp(fills, 7) + rp(pv, 8) + rp((bufferVerts(wc) * 12 / 1048576).toFixed(2), 8) +
+          rp(best.toFixed(1), 8) + rp(r.perDraw.toFixed(2), 8) + rp(r.cpu.toFixed(2), 8) + rp(r.reps, 5) +
+          rp(r2.perDraw.toFixed(2), 8) + rp(r2.cpu.toFixed(2), 8) + rp(wgrMs.toFixed(1), 7) + rp(v, 7) + (v2 !== v ? ' / ' + v2 : ''));
+      results.strat.push({ scene: nm, strategy: st, nVis: X.s.nVis, fills, pathVerts: pv,
+        wgrVerts: wc.verts, strokeVerts: wc.strokeVerts, wgrScans: wc.scans, wgrTraps: wc.traps,
+        raster: +best.toFixed(3), perFrame: +r.perDraw.toFixed(3), cpu: +r.cpu.toFixed(3), reps: r.reps,
+        replay: +r2.perDraw.toFixed(3), replayCpu: +r2.cpu.toFixed(3), replayReps: r2.reps, replayVerdict: v2,
+        wgrMs: +wgrMs.toFixed(3), still: STILL, verdict: v });
+    }
+    rc.c.remove();
+  }
+  log('');
+}
+
+// ===========================================================================
+// B -- does a junction fix change the picture?
+// ===========================================================================
+// Two renders per variant, on black and on white, CPU raster.  Their difference
+// is the per-pixel coverage of the whole frame (4.8's black/white method):
+//   alpha = 1 - (white - black) / 255
+// gap     sum max(0, alphaRef - alpha) over pixels where the 4x union is solid
+// dPix    pixels differing from the UNFIXED band by > 1/255 (on black)
+// d8      ... by > 8/255 ; maxD the largest channel difference
+function renderRGBA(X, st, bg, ctxCache) {
+  const c = ctxCache.ctx;
+  drawFrame(X, st, c, bg);
+  return c.getImageData(0, 0, W, H).data;
+}
+function unionAlpha4x(X) {
+  // every visible face, one path, one fill, 4x, on black then white
+  const S = 4, big = mk(W * S, H * S, { alpha: false, willReadFrequently: true }), c = big.ctx;
+  const { order, sx, sy } = X.s, idx = X.mesh.idx;
+  const one = (bg, fg) => {
+    c.setTransform(1, 0, 0, 1, 0, 0); c.fillStyle = bg; c.fillRect(0, 0, W * S, H * S);
+    c.setTransform(S, 0, 0, S, 0, 0); c.fillStyle = fg; c.beginPath();
+    for (let i = 0; i < X.s.nVis; i++) {
+      const t = order[i], a = idx[3 * t], b = idx[3 * t + 1], q = idx[3 * t + 2];
+      c.moveTo(sx[a], sy[a]); c.lineTo(sx[b], sy[b]); c.lineTo(sx[q], sy[q]);
+    }
+    c.fill();
+    return c.getImageData(0, 0, W * S, H * S).data;
+  };
+  const d = one('#000', '#fff');
+  const al = new Float32Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let s = 0;
+    for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) s += d[((y * S + j) * W * S + x * S + i) * 4];
+    al[y * W + x] = s / (S * S * 255);
+  }
+  big.c.remove();
+  return al;
+}
+// bloat   sum max(0, alpha - alphaRef) where the 4x union is NOT solid: ink the
+//         repair put outside the object (4.8's "outline")
+// acc     at the pixels where a variant differs from the unfixed band: mean
+//         |variant - ref| against mean |band - ref|, ref = the UNFIXED band
+//         rendered at 4x and box-filtered.  The exact fixes change geometry
+//         nowhere, so this says which of the two 1x renders the rasteriser
+//         got closer to the geometry both describe.
+function render4x(X, st, bg) {
+  const S = 4, big = mk(W * S, H * S, { alpha: false, willReadFrequently: true }), c = big.ctx;
+  c.setTransform(S, 0, 0, S, 0, 0);
+  drawFrame(X, st, c, bg);
+  const d = c.getImageData(0, 0, W * S, H * S).data;
+  const out = new Float32Array(W * H * 3);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let r = 0, g = 0, b = 0;
+    for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+      const k = ((y * S + j) * W * S + x * S + i) * 4; r += d[k]; g += d[k + 1]; b += d[k + 2];
+    }
+    const o = (y * W + x) * 3; out[o] = r / 16; out[o + 1] = g / 16; out[o + 2] = b / 16;
+  }
+  big.c.remove();
+  return out;
+}
+async function partB() {
+  log('B -- band junction fixes against the unfixed band (option 7, w = ' + BAND_W + ' px), CPU raster');
+  log('    ' + pd('variant', 29) + rp('pathV', 8) + rp('gap', 9) + rp('bloat', 8) + rp('dPix', 8) + rp('d>8', 7) + rp('maxD', 6) + rp('err v/band', 13));
+  const variants = ['boundary', 'band', 'band+spike', 'band+spike+reflex', 'band+spike+reflexAny', 'band+spike+reflexAny+noPinch',
+                    'band+exact2', 'band+all+bevel', 'band+all+short1', 'band+exact+shortReflex', 'band+exact+endclip', 'band+exact+end8',
+                    'band+exact2+end8', 'band+exact2+end8+shortReflex', 'shipped']
+    .filter(n => !Q.get('bands') || n === 'band' || Q.get('bands').split(',').includes(n));
+  const cc = mk(W, H, { alpha: false, willReadFrequently: true });
+  for (const [nm, mk_, sh, bd] of CASES) {
+    statusEl.textContent = 'B ' + nm;
+    const X = setup(mk_, sh, bd);
+    const aRef = unionAlpha4x(X);
+    const ref4 = render4x(X, 'band', '#000');
+    let baseB = null;
+    const rows = [];
+    for (const st of ['band', ...variants.filter(v => v !== 'band')]) {
+      const kb = renderRGBA(X, st, '#000', cc).slice();
+      const kw = renderRGBA(X, st, '#fff', cc);
+      const pv = X.E.verts;
+      let gap = 0, bloat = 0;
+      for (let p = 0, i = 0; p < W * H; p++, i += 4) {
+        const a = 1 - ((kw[i] - kb[i]) + (kw[i + 1] - kb[i + 1]) + (kw[i + 2] - kb[i + 2])) / (3 * 255);
+        if (aRef[p] >= 0.999) { if (aRef[p] > a) gap += aRef[p] - a; }
+        else if (a > aRef[p]) bloat += a - aRef[p];
+      }
+      let dPix = 0, d8 = 0, maxD = 0, eV = 0, eB = 0;
+      if (!baseB) baseB = kb;
+      else for (let i = 0, p = 0; i < kb.length; i += 4, p++) {
+        const m = Math.max(Math.abs(kb[i] - baseB[i]), Math.abs(kb[i + 1] - baseB[i + 1]), Math.abs(kb[i + 2] - baseB[i + 2]));
+        if (m > 1) {
+          dPix++;
+          for (let ch = 0; ch < 3; ch++) { eV += Math.abs(kb[i + ch] - ref4[p * 3 + ch]); eB += Math.abs(baseB[i + ch] - ref4[p * 3 + ch]); }
+        }
+        if (m > 8) d8++; if (m > maxD) maxD = m;
+      }
+      rows.push([st, pv, gap, bloat, dPix, d8, maxD, dPix ? eV / (3 * dPix) : 0, dPix ? eB / (3 * dPix) : 0]);
+    }
+    log('  ' + nm + '  (' + X.s.nVis + ' visible)');
+    for (const [st, pv, gap, bloat, dPix, d8, maxD, eV, eB] of rows) {
+      const first = st === 'band';
+      log('    ' + pd(st, 29) + rp(pv, 8) + rp(gap.toFixed(2), 9) + rp(bloat.toFixed(2), 8) + rp(first ? '-' : dPix, 8) +
+          rp(first ? '-' : d8, 7) + rp(first ? '-' : maxD, 6) + rp(first || !dPix ? '-' : eV.toFixed(1) + '/' + eB.toFixed(1), 13));
+      results.band.push({ scene: nm, variant: st, pathVerts: pv, gap: +gap.toFixed(3), bloat: +bloat.toFixed(3),
+                          dPix, d8, maxD, errVariant: +eV.toFixed(3), errBand: +eB.toFixed(3) });
+    }
+  }
+  cc.c.remove();
+  log('');
+}
+
+// ===========================================================================
+// F -- fragmentation: when does welding stop paying on a CPU rasteriser?
+// ===========================================================================
+// Same two meshes, the palette's shade count varied: more shades, smaller
+// colour regions, more boundary per face.  x = emitted boundary verts / 3n
+// (1.0 = edge cancellation bought nothing).  A3 raster for the welded and
+// the per-face frame, seam-repaired and not, plus main-thread ms on a canvas
+// that is never read (min of reps).
+async function partF() {
+  const reps = QUICK ? 2 : 5;
+  log('F -- fragmentation sweep (A3 raster ms / main-thread ms)');
+  log('    ' + pd('scene', 16) + rp('shades', 7) + rp('fills', 6) + rp('v/3n', 6) + rp('perFace', 9) + rp('boundary', 9) +
+      rp('pF+band', 9) + rp('band', 9) + rp('cpu pF', 8) + rp('cpu bnd', 8));
+  const sweeps = [['S1 torusKnot', () => makeTorusKnot(512, 64, 3, 7, 8), 8, [2, 4, 8, 16, 32]],
+                  ['S3 grid', () => makeGrid(180, 4), 4, [2, 6, 12, 24, 48]]];
+  const rc = mk(W, H, { alpha: false, willReadFrequently: true });
+  const dc = mk(W, H);
+  for (const [nm, mk_, bd, shadesList] of sweeps) {
+    for (const sh of shadesList) {
+      statusEl.textContent = 'F ' + nm + ' ' + sh;
+      const X = setup(mk_, sh, bd);
+      const r = {};
+      for (const st of ['perFace', 'boundary', 'perFace+band', 'band+spike+reflex']) {
+        let best = Infinity, cpu = Infinity;
+        for (let k = 0; k < reps; k++) {
+          const t0 = performance.now(); drawFrame(X, st, rc.ctx); rc.ctx.getImageData(0, 0, 1, 1);
+          best = Math.min(best, performance.now() - t0);
+          const c0 = performance.now(); drawFrame(X, st, dc.ctx); cpu = Math.min(cpu, performance.now() - c0);
+          await nextFrame();
+        }
+        r[st] = { raster: +best.toFixed(3), cpu: +cpu.toFixed(3), fills: X.E.fills, verts: X.E.verts };
+      }
+      const x = r.boundary.verts / (3 * X.s.nVis);
+      log('    ' + pd(nm, 16) + rp(sh, 7) + rp(r.boundary.fills, 6) + rp(x.toFixed(2), 6) +
+          rp(r.perFace.raster.toFixed(1), 9) + rp(r.boundary.raster.toFixed(1), 9) +
+          rp(r['perFace+band'].raster.toFixed(1), 9) + rp(r['band+spike+reflex'].raster.toFixed(1), 9) +
+          rp(r.perFace.cpu.toFixed(1), 8) + rp(r.boundary.cpu.toFixed(1), 8));
+      results.frag.push({ scene: nm, shades: sh, nVis: X.s.nVis, fills: r.boundary.fills, vRatio: +x.toFixed(4),
+        perFace: r.perFace, boundary: r.boundary, perFaceBand: r['perFace+band'], band: r['band+spike+reflex'] });
+    }
+  }
+  rc.c.remove(); dc.c.remove();
+  log('');
+}
+
+// ===========================================================================
+// K -- do strokes spend the same budget?  (A7 against A9's stroke model)
+// ===========================================================================
+// Synthetic, held still: N open 10-segment polylines, lineWidth 0.5, opaque
+// source-over -- which Gecko sends through aa-stroke (AAStrokeMode::Geometry)
+// into the same path vertex buffer as WGR fills.  N is chosen so the MODELLED
+// output (bench/wgr.mjs aaStroke) is a given multiple of the buffer.  The
+// same for fills, as the control: N small triangles sized by WGR output.
+function polylines(N, seed) {
+  const subs = [];
+  let r = seed;
+  const rnd = () => ((r = (r * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  for (let i = 0; i < N; i++) {
+    const x0 = 20 + rnd() * (W - 140), y0 = 20 + rnd() * (H - 60), p = [];
+    for (let k = 0; k <= 10; k++) p.push(x0 + k * 10, y0 + (k & 1) * 6 + rnd());
+    subs.push(p);
+  }
+  return subs;
+}
+function tris(N, seed) {
+  const subs = [];
+  let r = seed;
+  const rnd = () => ((r = (r * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  for (let i = 0; i < N; i++) {
+    const x0 = 10 + rnd() * (W - 40), y0 = 10 + rnd() * (H - 40);
+    subs.push([x0, y0, x0 + 14 + rnd() * 6, y0 + rnd() * 4, x0 + rnd() * 6, y0 + 14 + rnd() * 6]);
+  }
+  return subs;
+}
+async function stillVerdict(draw, frames) {
+  const t = mk(W, H);
+  for (let f = 0; f < frames; f++) { t.ctx.fillStyle = BG; t.ctx.fillRect(0, 0, W, H); draw(t.ctx); await nextFrame(); }
+  await nextFrame();
+  const v = verdict(t.c); t.c.remove(); return v;
+}
+async function partK() {
+  const frames = QUICK ? 30 : 40, budget = pathBufferVerts(BUF_MB);
+  log('K -- strokes vs the path vertex buffer (' + BUF_MB + ' MB = ' + budget + ' verts), held still, ' + frames + ' frames');
+  log('    ' + pd('case', 34) + rp('paths', 7) + rp('model verts', 12) + rp('x buf', 7) + rp('accel', 7));
+  // per-unit output, measured once through the models
+  const one = polylines(1, 7)[0], oneT = tris(1, 7)[0];
+  const sb = new Float32Array(2 + one.length); sb[0] = one.length / 2; sb[1] = 0; sb.set(one, 2);
+  const perLine = aaStroke(sb, sb.length, 0.5);
+  const wc = WC(); wc.beginPath(); wc.moveTo(oneT[0], oneT[1]); wc.lineTo(oneT[2], oneT[3]); wc.lineTo(oneT[4], oneT[5]); wc.fill();
+  const perTri = wc.verts;
+  for (const kind of ['stroke', 'fill']) {
+    for (const mult of [0.5, 0.9, 1.2, 2, 3]) {
+      statusEl.textContent = 'K ' + kind + ' ' + mult;
+      const N = Math.round(mult * budget / (kind === 'stroke' ? perLine : perTri));
+      const subs = kind === 'stroke' ? polylines(N, 11) : tris(N, 11);
+      // exact model total for these very paths
+      const m = WC(); let model = 0;
+      if (kind === 'stroke') { m.lineWidth = 0.5; for (const p of subs) { m.beginPath(); m.moveTo(p[0], p[1]); for (let i = 2; i < p.length; i += 2) m.lineTo(p[i], p[i + 1]); m.stroke(); } model = m.strokeVerts; }
+      else { for (const p of subs) { m.beginPath(); m.moveTo(p[0], p[1]); m.lineTo(p[2], p[3]); m.lineTo(p[4], p[5]); m.fill(); } model = m.verts; }
+      const uniq = uniqBufferVerts(m);
+      const v = await stillVerdict((c) => {
+        c.lineWidth = 0.5;
+        for (let i = 0; i < subs.length; i++) {
+          const p = subs[i]; c.beginPath(); c.moveTo(p[0], p[1]);
+          for (let k = 2; k < p.length; k += 2) c.lineTo(p[k], p[k + 1]);
+          if (kind === 'stroke') { c.strokeStyle = i & 1 ? '#c86' : '#6ac'; c.stroke(); }
+          else { c.fillStyle = i & 1 ? '#c86' : '#6ac'; c.fill(); }
+        }
+      }, frames);
+      log('    ' + pd(kind + ' x ' + mult, 34) + rp(N, 7) + rp(model, 12) + rp((model / budget).toFixed(2), 7) + rp(v, 7));
+      results.strokeBudget.push({ kind, target: mult, paths: N, modelVerts: model, ofBuffer: +(model / budget).toFixed(4),
+                                  uniqOfBuffer: +(uniq / budget).toFixed(4), bufMB: BUF_MB, verdict: v });
+    }
+  }
+  // the scene case that disagreed with the model in part D
+  const [nm, mk_, sh, bd] = CASES[1];
+  const X = setup(mk_, sh, bd);
+  for (const st of ['boundary', 'shipped']) {
+    statusEl.textContent = 'K ' + nm + ' ' + st;
+    const m = WC(); runStrategy(st, X, m);
+    const v = await stillVerdict((c) => runStrategy(st, X, c), frames);
+    log('    ' + pd(nm + ' / ' + st, 34) + rp(X.E.fills, 7) + rp(bufferVerts(m), 12) + rp((bufferVerts(m) / budget).toFixed(2), 7) + rp(v, 7));
+    results.strokeBudget.push({ kind: nm + ' / ' + st, paths: X.E.fills, modelVerts: bufferVerts(m), strokeVerts: m.strokeVerts,
+                                ofBuffer: +(bufferVerts(m) / budget).toFixed(4), bufMB: BUF_MB, verdict: v });
+  }
+  log('');
+}
+
+// ===========================================================================
+// D -- which side of the cliff, per strategy, still and animated (A7)
+// ===========================================================================
+// The field report (4.12) was "20 000 small fills stay accelerated, fewer
+// bigger welded chunks demote".  The claim under test: the verdict follows
+// the tessellated bytes per frame (A9) against gpu-path-size, not fills and
+// not path vertices -- and animation demotes everything via the miss ratio.
+async function partD() {
+  const frames = QUICK ? 30 : 45;
+  const budget = pathBufferVerts(BUF_MB);
+  log('D -- verdict per strategy: held still (paths repeat) and animated (every path novel), ' + frames + ' frames each');
+  log('    ' + pd('scene / strategy', 32) + rp('fills', 7) + rp('pathV', 8) + rp('x buf', 7) + rp('still', 7) + rp('anim', 7));
+  const list = ['perFace', 'boundary', 'boundary+loc32', 'band', 'band+spike+reflex', 'shipped'];
+  for (const [nm, mk_, sh, bd] of CASES) {
+    const X = setup(mk_, sh, bd);
+    for (const st of list) {
+      statusEl.textContent = 'D ' + nm + ' ' + st;
+      X.scene.build(ANG[0], ANG[1], ANG[2], ANG[3], ANG[4]); X.s.nVis = X.scene.nVis; X.frame = 0;
+      const wc = WC(); runStrategy(st, X, wc);
+      const fills = X.E.fills, pv = X.E.verts, xb = bufferVerts(wc) / budget;
+      const vv = [];
+      for (const anim of [false, true]) {
+        const t = mk(W, H);
+        for (let f = 0; f < frames; f++) { rebuild(X, anim); drawFrame(X, st, t.ctx); await nextFrame(); }
+        await nextFrame();
+        vv.push(verdict(t.c)); t.c.remove();
+        X.scene.build(ANG[0], ANG[1], ANG[2], ANG[3], ANG[4]); X.s.nVis = X.scene.nVis; X.frame = 0;
+      }
+      log('    ' + pd(nm + ' / ' + st, 32) + rp(fills, 7) + rp(pv, 8) + rp(xb.toFixed(2), 7) + rp(vv[0], 7) + rp(vv[1], 7));
+      results.demote.push({ scene: nm, strategy: st, fills, pathVerts: pv, wgrVerts: wc.verts, strokeVerts: wc.strokeVerts, ofBuffer: +xb.toFixed(4),
+                            uniqOfBuffer: +(uniqBufferVerts(wc) / budget).toFixed(4),
+                            bufMB: BUF_MB, still: vv[0], animated: vv[1] });
+    }
+  }
+  log('');
+}
+
+// ===========================================================================
+// S -- the Skia tiers, one path at a time
+// ===========================================================================
+// Same pixel area (~24 000 px2), same vertex count where it can be held, the
+// shape varied: convex polygon / star-shaped concave / self-crossing / the
+// same area as many disjoint convex subpaths.  A3, min of reps.
+async function partS() {
+  statusEl.textContent = 'S tiers';
+  const SH = tierShapes(), reps = QUICK ? 3 : 9, N = 200;
+  log('S -- one path, drawn ' + N + 'x per timing: the Skia tier by shape (A3, min of ' + reps + ')');
+  const rc = mk(W, H, { alpha: false, willReadFrequently: true }), c = rc.ctx;
+  for (const [name, subs] of Object.entries(SH)) {
+    const wc = new WgrContext(1 << 16, W, H);
+    wc.beginPath(); for (const p of subs) { wc.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) wc.lineTo(p[i][0], p[i][1]); } wc.fill();
+    let best = Infinity;
+    for (let r = 0; r < reps; r++) {
+      const t0 = performance.now();
+      for (let k = 0; k < N; k++) {
+        c.fillStyle = k & 1 ? '#abc' : '#cba'; c.beginPath();
+        for (const p of subs) { c.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) c.lineTo(p[i][0], p[i][1]); }
+        c.fill();
+      }
+      c.getImageData(0, 0, 1, 1);
+      const dt = performance.now() - t0; if (dt < best) best = dt;
+    }
+    log('    ' + pd(name, 10) + rp((best / N * 1000).toFixed(1), 8) + ' us/fill   WGR ' + rp(wc.verts, 6) + ' verts, ' + rp(wc.scans, 4) + ' scans');
+    results.tiers.push({ shape: name, usPerFill: +(best / N * 1000).toFixed(2), wgrVerts: wc.verts, wgrScans: wc.scans });
+  }
+  rc.c.remove();
+  log('');
+}
+
+// ===========================================================================
+// G -- the same shapes on the GPU canvas (A2)
+// ===========================================================================
+// Part S's shapes, drawn 200x per unit on the displayed canvas, sustained.
+// One more row: the 16 hexagons as 16 SEPARATE fill() calls, each one convex
+// contour -- what Ganesh's AAConvexPathRenderer takes (Graphite has its own
+// convex route: check chrome://gpu for which backend you timed), and can merge across
+// calls (3.1), where the one-path version is never convex.  Each unit is
+// shifted by a fraction of a pixel so no path repeats (Firefox's cache keys on
+// a 1/4 px quantised path, 3.2); ?still=1 repeats the same 200 per draw.
+// But a translated path is still the SAME cache key on Firefox (T68: the key
+// is relative to the path's own bounds origin), so the shift is novel for
+// Chromium and a cache hit for Gecko.  ?grot=1 instead rotates and scales each
+// unit about its centre by irrational steps -- a genuinely new shape per unit.
+const GROT = Q.get('grot') === '1';
+async function partG() {
+  const SH = tierShapes(), N = 200, callbacks = QUICK ? 10 : 30;
+  log('G -- the tier shapes on the displayed canvas, ' + N + ' units per draw (A2, ' +
+      (STILL ? 'paths repeat' : GROT ? 'every unit rotated + scaled: a new shape' : 'every unit shifted: new for Chromium, a cache hit for Gecko') + '), us per unit');
+  log('    ' + pd('shape', 22) + rp('fills/unit', 11) + rp('us A2', 8) + rp('us cpu', 8) + rp('reps', 6) + rp('accel', 7));
+  const rows = [['convex', SH.convex, false], ['concave', SH.concave, false], ['crossing', SH.crossing, false],
+                ['16 hex, one path', SH.subpaths, false], ['16 hex, 16 fills', SH.subpaths, true]];
+  let gk = 0;
+  for (const [name, subs, separate] of rows) {
+    statusEl.textContent = 'G ' + name;
+    const t = mkShown(), c = t.ctx;
+    c.fillStyle = BG; c.fillRect(0, 0, W, H);
+    let mx = 0, my = 0, np = 0;
+    for (const p of subs) for (const q of p) { mx += q[0]; my += q[1]; np++; }
+    mx /= np; my /= np;
+    const draw = () => {
+      for (let k = 0; k < N; k++) {
+        const g = STILL ? k : gk++;
+        const dx = GROT ? 0 : (g * 0.6180339) % 1;
+        const a = GROT ? ((g * 0.6180339) % 1) * 6.2831853 : 0, sc = GROT ? 0.9 + 0.2 * ((g * 0.4142136) % 1) : 1;
+        const ca = Math.cos(a) * sc, sa = Math.sin(a) * sc;
+        c.fillStyle = k & 1 ? '#abc' : '#cba';
+        if (!separate) c.beginPath();
+        for (const p of subs) {
+          if (separate) c.beginPath();
+          for (let i = 0; i < p.length; i++) {
+            const ux = p[i][0] - mx, uy = p[i][1] - my;
+            const x = mx + ca * ux - sa * uy + dx, y = my + sa * ux + ca * uy;
+            if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+          }
+          if (separate) c.fill();
+        }
+        if (!separate) c.fill();
+      }
+    };
+    const r = await sustainedReps(draw, callbacks);
+    await nextFrame();
+    const v = verdict(t.c); t.c.remove();
+    log('    ' + pd(name, 22) + rp(separate ? subs.length : 1, 11) + rp((r.perDraw / N * 1000).toFixed(1), 8) +
+        rp((r.cpu / N * 1000).toFixed(1), 8) + rp(r.reps, 6) + rp(v, 7));
+    results.gpuTiers.push({ shape: name, fillsPerUnit: separate ? subs.length : 1, usPerUnit: +(r.perDraw / N * 1000).toFixed(3),
+                            cpuUsPerUnit: +(r.cpu / N * 1000).toFixed(3), reps: r.reps, still: STILL, grot: GROT, verdict: v });
+  }
+  log('');
+}
+
+// ===========================================================================
+// O -- when to merge same-colour polygons into one fill()
+// ===========================================================================
+// 16 same-colour shapes on a 4 x 4 grid, the spacing varied: disjoint
+// hexagons, squares that TOUCH (every shared edge left in the path, twice,
+// opposite ways -- what a batcher emits without edge cancellation), the same
+// squares cancelled to their union outline, and hexagons that overlap a
+// little and a lot.  Each as one path of 16 subpaths and as 16 fill() calls.
+// A3 (CPU raster, min of reps) and A2 (displayed canvas, sustained, every
+// unit shifted a fraction of a pixel), both per unit of 16 shapes; A9 for
+// both cuts; and how many pixels the two cuts disagree on (one path fills the
+// union once; 16 opaque fills stack their antialiased edges inside it).
+async function partO() {
+  const N = 1000, reps = QUICK ? 3 : 9, callbacks = QUICK ? 10 : 30;
+  log('O -- 16 same-colour shapes: one path against 16 fills, us per unit of 16 (A3: ' + N + ' units, min of ' + reps + '; A2: 200 units, sustained), WGR (A9)');
+  log('    ' + pd('layout', 34) + pd('cut', 9) + rp('A3 us', 8) + rp('A2 us', 8) + rp('WGR', 7) + rp('scans', 6) + rp('px diff', 8) + rp('max d', 6));
+  const pathOf = (c, subs, sep, dx) => {
+    if (!sep) c.beginPath();
+    for (const p of subs) {
+      if (sep) c.beginPath();
+      c.moveTo(p[0][0] + dx, p[0][1]); for (let i = 1; i < p.length; i++) c.lineTo(p[i][0] + dx, p[i][1]);
+      if (sep) c.fill();
+    }
+    if (!sep) c.fill();
+  };
+  const onePath = {};                     // layout -> its one-path image, for the union rows
+  for (const [name, subs, both, ref] of mergeLayouts()) {
+    const img = [];
+    for (const sep of both ? [false, true] : [false]) {
+      statusEl.textContent = 'O ' + name + (sep ? ' 16 fills' : ' one path');
+      const wc = WC(); pathOf(wc, subs, sep, 0);
+      const rc = mk(W, H, { alpha: false, willReadFrequently: true }), c = rc.ctx;
+      let best = Infinity;
+      for (let r = 0; r < reps; r++) {
+        c.fillStyle = BG; c.fillRect(0, 0, W, H);
+        const t0 = performance.now();
+        for (let k = 0; k < N; k++) { c.fillStyle = k & 1 ? '#abc' : '#cba'; pathOf(c, subs, sep, 0); }
+        c.getImageData(0, 0, 1, 1);
+        const dt = performance.now() - t0; if (dt < best) best = dt;
+      }
+      c.fillStyle = BG; c.fillRect(0, 0, W, H); c.fillStyle = '#abc'; pathOf(c, subs, sep, 0);
+      img.push(c.getImageData(0, 0, W, H).data); rc.c.remove();
+      if (!sep) onePath[name] = img[0];
+      const t = mkShown(), g = t.ctx; let gk = 0;
+      g.fillStyle = BG; g.fillRect(0, 0, W, H);
+      const r2 = await sustainedReps(() => { for (let k = 0; k < 200; k++) { g.fillStyle = k & 1 ? '#abc' : '#cba'; pathOf(g, subs, sep, (gk++ * 0.6180339) % 1); } }, callbacks);
+      await nextFrame(); const v = verdict(t.c); t.c.remove();
+      let nd = 0, md = 0;
+      const cmpTo = sep ? img[0] : ref ? onePath[ref] : null;
+      if (cmpTo) { const a = cmpTo, b = img[sep ? 1 : 0]; for (let i = 0; i < a.length; i += 4) { const d = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2])); if (d > 1) nd++; if (d > md) md = d; } }
+      const us = best / N * 1000, us2 = r2.perDraw / 200 * 1000;
+      log('    ' + pd(name, 34) + pd(sep ? 'separate' : 'one path', 9) + rp(us.toFixed(1), 8) + rp(us2.toFixed(1), 8) +
+          rp(wc.verts, 7) + rp(wc.scans, 6) + rp(cmpTo ? nd : '', 8) + rp(cmpTo ? md : '', 6) + '  ' + v);
+      results.overlap.push({ layout: name, cut: sep ? 'separate' : 'one path', shapes: subs.length, a3Us: +us.toFixed(2), a2Us: +us2.toFixed(3),
+                             wgrVerts: wc.verts, wgrScans: wc.scans, pxDiff: cmpTo ? nd : null, maxDiff: cmpTo ? md : null, diffAgainst: sep ? 'one path' : ref || null, verdict: v });
+    }
+  }
+  log('');
+}
+
+// ===========================================================================
+// N -- "20 000 small faces / 60 000 verts stay accelerated" (field report)
+// ===========================================================================
+// 20 000 triangles, each its own fill() -- 60 000 path verts -- at several
+// sizes, two layouts: scattered (random position and orientation, edge L) and
+// a mesh (a 100 x 100 grid of L px cells, two triangles each, sharing the
+// diagonal, drawn per face).  Counted through WGR (A9); verdict (A7) held
+// still, moved (every triangle shifted by a fresh fraction of a pixel each
+// frame -- the same cache key, T68) and turned (every triangle rotated about
+// its centroid by a fresh angle each frame -- a new shape); A2 held still.
+// fieldLoad(kind, L, N, seed): bench/pathshape.js, shared with bench/ffcache.mjs
+async function partN() {
+  const N = 20000, frames = QUICK ? 30 : 45, callbacks = QUICK ? 10 : 20, budget = pathBufferVerts(BUF_MB);
+  log('N -- 20 000 separate triangle fills (60 000 path verts), ' + BUF_MB + ' MB = ' + budget + ' verts, ' + frames + ' frames per verdict');
+  log('    ' + pd('load', 18) + rp('WGR verts', 10) + rp('/tri', 6) + rp('x buf', 7) + rp('keys', 7) + rp('uniq x', 7) + rp('still', 7) + rp('moved', 7) + rp('turned', 7) + rp('A2 still', 9) + rp('cpu', 7) + rp('A2 turn', 9) + rp('accel', 7));
+  const loads = [['scatter', 1], ['scatter', 2], ['scatter', 4], ['scatter', 8], ['scatter', 15],
+                 ['mesh', 1], ['mesh', 2], ['mesh', 4], ['mesh', 7]];
+  for (const [kind, L] of loads) {
+    statusEl.textContent = 'N ' + kind + ' ' + L;
+    const T = fieldLoad(kind, L, N, 99);
+    const wc = WC();
+    for (let i = 0; i < N; i++) { const o = 6 * i; wc.beginPath(); wc.moveTo(T[o], T[o + 1]); wc.lineTo(T[o + 2], T[o + 3]); wc.lineTo(T[o + 4], T[o + 5]); wc.fill(); }
+    const draw = (c, dx) => {
+      for (let i = 0; i < N; i++) {
+        const o = 6 * i; c.fillStyle = i & 1 ? '#c86' : '#6ac';
+        c.beginPath(); c.moveTo(T[o] + dx, T[o + 1]); c.lineTo(T[o + 2] + dx, T[o + 3]); c.lineTo(T[o + 4] + dx, T[o + 5]); c.fill();
+      }
+    };
+    // ... and every triangle turned about its centroid by a fresh angle each
+    // frame: what a rotating 3D view does to small faces
+    const drawRot = (c, f) => {
+      for (let i = 0; i < N; i++) {
+        const o = 6 * i, cx = (T[o] + T[o + 2] + T[o + 4]) / 3, cy = (T[o + 1] + T[o + 3] + T[o + 5]) / 3;
+        const a = (((f + 1) * 0.6180339 + i * 0.7548777) % 1) * 6.2831853, ca = Math.cos(a), sa = Math.sin(a);
+        c.fillStyle = i & 1 ? '#c86' : '#6ac'; c.beginPath();
+        for (let v = 0; v < 3; v++) {
+          const ux = T[o + 2 * v] - cx, uy = T[o + 2 * v + 1] - cy, x = cx + ca * ux - sa * uy, y = cy + sa * ux + ca * uy;
+          if (v === 0) c.moveTo(x, y); else c.lineTo(x, y);
+        }
+        c.fill();
+      }
+    };
+    const vv = [];
+    for (const anim of [0, 1, 2]) {
+      const t = mk(W, H);
+      for (let f = 0; f < frames; f++) {
+        t.ctx.fillStyle = BG; t.ctx.fillRect(0, 0, W, H);
+        if (anim === 2) drawRot(t.ctx, f); else draw(t.ctx, anim ? ((f + 1) * 0.6180339) % 1 : 0);
+        await nextFrame();
+      }
+      await nextFrame();
+      vv.push(verdict(t.c)); t.c.remove();
+    }
+    const t = mkShown();
+    const r = await sustainedReps(() => { t.ctx.fillStyle = SUST_BG; t.ctx.fillRect(0, 0, W, H); draw(t.ctx, 0); }, callbacks);
+    await nextFrame();
+    const v2 = verdict(t.c); t.c.remove();
+    // A2 of the turned load: every triangle a fresh angle every draw
+    const t3 = mkShown();
+    let ff = 0;
+    const r3 = await sustainedReps(() => { t3.ctx.fillStyle = SUST_BG; t3.ctx.fillRect(0, 0, W, H); drawRot(t3.ctx, ff++); }, callbacks);
+    await nextFrame();
+    const v3 = verdict(t3.c); t3.c.remove();
+    log('    ' + pd(kind + ' ' + L + ' px', 18) + rp(wc.verts, 10) + rp((wc.verts / N).toFixed(1), 6) + rp((wc.verts / budget).toFixed(2), 7) +
+        rp(wc.keys, 7) + rp((wc.uniqVerts / budget).toFixed(2), 7) + rp(vv[0], 7) + rp(vv[1], 7) + rp(vv[2], 7) + rp(r.perDraw.toFixed(2), 9) + rp(r.cpu.toFixed(2), 7) + (v2 !== vv[0] ? '  (A2 canvas: ' + v2 + ')' : '') +
+        rp(r3.perDraw.toFixed(2), 9) + rp(v3, 7));
+    results.field.push({ kind, L, tris: N, wgrVerts: wc.verts, perTri: +(wc.verts / N).toFixed(2), ofBuffer: +(wc.verts / budget).toFixed(4),
+                         keys: wc.keys, uniqVerts: wc.uniqVerts, uniqOfBuffer: +(wc.uniqVerts / budget).toFixed(4),
+                         bufMB: BUF_MB, still: vv[0], animated: vv[1], turned: vv[2], a2Still: +r.perDraw.toFixed(3), cpu: +r.cpu.toFixed(3), reps: r.reps, a2Verdict: v2,
+                         a2Turned: +r3.perDraw.toFixed(3), a2TurnedCpu: +r3.cpu.toFixed(3), a2TurnedVerdict: v3 });
+  }
+  log('');
+}
+
+// ===========================================================================
+// Z -- what does an opaque full-canvas clear do to a repeated draw?  (T71)
+// ===========================================================================
+// One recorded frame replayed R times per rAF callback, R fixed (no
+// calibration), opening with an opaque clear or with the 0.996 one.  Built to
+// test "the engine discards queued draws under an opaque full-canvas fill",
+// which predicts the opaque column falling like 1/R; measured on M6 Chromium
+// it RISES instead (T71).
+async function partZ() {
+  const [nm, mk_, sh, bd] = CASES[0];
+  const X = setup(mk_, sh, bd), callbacks = QUICK ? 8 : 20;
+  log('Z -- ' + nm + ', one recorded frame replayed R times per rAF callback: A2 ms per draw (main thread)');
+  log('    ' + pd('cut', 12) + pd('clear', 9) + [1, 2, 4, 8, 16].map(R => rp('R=' + R, 15)).join(''));
+  for (const st of ['boundary', 'shipped']) {
+    for (const [lab, bg] of [['opaque', BG], ['a 0.996', SUST_BG]]) {
+      statusEl.textContent = 'Z ' + st + ' ' + lab;
+      const rec = new RecCtx(); drawFrame(X, st, rec, bg); const F = rec.take();
+      const cells = [];
+      for (const R of [1, 2, 4, 8, 16]) {
+        const t = mkShown();
+        const r = await new Promise(resolve => {
+          let n = -6, t0 = 0, cpu = 0;
+          function step() {
+            const now = performance.now();
+            if (n === 0) t0 = now;
+            if (n === callbacks) { resolve({ perDraw: (now - t0) / (callbacks * R), cpu: cpu / (callbacks * R) }); return; }
+            const c0 = performance.now();
+            for (let k = 0; k < R; k++) replay(F, t.ctx);
+            if (n >= 0) cpu += performance.now() - c0;
+            n++; requestAnimationFrame(step);
+          }
+          requestAnimationFrame(step);
+        });
+        t.c.remove();
+        cells.push(r);
+        results.clearTest = results.clearTest || [];
+        results.clearTest.push({ scene: nm, strategy: st, clear: lab, R, perDraw: +r.perDraw.toFixed(3), cpu: +r.cpu.toFixed(3) });
+      }
+      log('    ' + pd(st, 12) + pd(lab, 9) + cells.map(r => rp(r.perDraw.toFixed(2) + ' (' + r.cpu.toFixed(2) + ')', 15)).join(''));
+    }
+  }
+  log('');
+}
+
+// ===========================================================================
+(async function main() {
+  let gpu = 'unknown';
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    gpu = !gl ? 'NO WEBGL' : dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  } catch (e) { gpu = 'probe failed'; }
+  const ctrl = mk(W, H);
+  for (let i = 0; i < 3; i++) { ctrl.ctx.fillStyle = '#204060'; ctrl.ctx.fillRect(0, 0, W, H); await nextFrame(); }
+  INDICATOR = accelFraction(ctrl.c) > 0.8; ctrl.c.remove();
+  results.env = { ua: navigator.userAgent, hc: navigator.hardwareConcurrency, gpu, indicator: INDICATOR, bufMB: BUF_MB,
+                  still: STILL, dpr: devicePixelRatio, parts: PARTS.join(','), search: location.search };
+  log('tessellation benchmark -- ' + TAG + '   ' + navigator.userAgent);
+  log('  webgl: ' + gpu + '   accel indicator: ' + (INDICATOR ? 'ON' : 'off') + '\n');
+  try {
+    if (PARTS.includes('C')) await partC();
+    if (PARTS.includes('D')) await partD();
+    if (PARTS.includes('K')) await partK();
+    if (PARTS.includes('S')) await partS();
+    if (PARTS.includes('G')) await partG();
+    if (PARTS.includes('N')) await partN();
+    if (PARTS.includes('O')) await partO();
+    if (PARTS.includes('Z')) await partZ();
+    if (PARTS.includes('T')) await partT();
+    if (PARTS.includes('B')) await partB();
+    if (PARTS.includes('F')) await partF();
+  } catch (e) { log('ERROR ' + (e.stack || e)); results.error = String(e); }
+  results.micro = [{ note: 'tess page complete' }];
+  statusEl.textContent = 'done';
+  await fetch('/result?tag=' + encodeURIComponent(TAG), { method: 'POST', body: JSON.stringify(results) }).catch(() => {});
+})();
+</script>

@@ -148,7 +148,8 @@ for (const [nm, mesh, sh, bd] of cases) {
   const B = new PainterBatcher({
     width: W, height: H, triangleCount: mesh.nt, vertexCount: mesh.nv,
     indices: mesh.idx, adjacency: mesh.adj, palette: scene.pal,
-    tile: 2, strokeSeams: true, seamStrokeOnly: true, strokeWidth: 0.5
+    tile: 2, strokeSeams: true, seamStrokeOnly: true, strokeWidth: 0.5,
+    seamBand: 0           // the seam-STROKE pass is what this counts; the default is the band since v1.30
   });
   const s = { order: scene.order, nVis: scene.nVis, colour: scene.col,
               sx: scene.sx, sy: scene.sy,

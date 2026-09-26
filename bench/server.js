@@ -5,7 +5,8 @@ fs.mkdirSync(OUT, { recursive: true });
 const PORT = Number(process.env.PORT || 8123);
 const leases = new Map();   // tag -> last heartbeat ms
 const LEASE_TTL = 20000;
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
+               '.wasm': 'application/wasm', '.json': 'application/json',
                '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
 
 http.createServer((req, res) => {
@@ -36,8 +37,13 @@ http.createServer((req, res) => {
     return;
   }
   if (u.pathname === '/release') { leases.delete(String(u.query.tag || '')); res.writeHead(200); res.end('ok'); return; }
-  let p = path.join(ROOT, u.pathname === '/' ? 'index.html' : u.pathname.replace(/^\/+/, ''));
-  if (!p.startsWith(ROOT)) { res.writeHead(403); res.end(); return; }
+  // /src/ is the reference implementation, one level up: pages import the
+  // shipped modules rather than a copy of them.
+  const SRC = path.join(ROOT, '..', 'src');
+  let p = u.pathname.startsWith('/src/')
+    ? path.join(SRC, u.pathname.slice(5))
+    : path.join(ROOT, u.pathname === '/' ? 'index.html' : u.pathname.replace(/^\/+/, ''));
+  if (!p.startsWith(ROOT) && !p.startsWith(SRC)) { res.writeHead(403); res.end(); return; }
   fs.readFile(p, (e, d) => {
     if (e) { res.writeHead(404); res.end('404'); return; }
     res.writeHead(200, { 'content-type': MIME[path.extname(p)] || 'application/octet-stream', 'cache-control': 'no-store' });

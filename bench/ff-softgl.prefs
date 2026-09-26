@@ -1,0 +1,19 @@
+// FF_PREFS_FILE for bench/run.js on a machine with no GPU (M4, 10.1).
+// Gecko blocklists hardware compositing and accelerated canvas on software GL
+// (llvmpipe); these force DrawTargetWebgl on anyway, so its LOGIC -- the path
+// cache, the usage profile, the demotion verdict, WGR tessellation -- runs
+// exactly as on a GPU.  Its TIMINGS do not: every "GPU" draw is llvmpipe on
+// the CPU.  Use this for A7 verdicts, never for accelerated frame times.
+user_pref("gfx.canvas.accelerated.force-enabled", true);
+user_pref("layers.acceleration.force-enabled", true);
+user_pref("layers.gpu-process.enabled", true);
+user_pref("layers.gpu-process.force-enabled", true);
+user_pref("gfx.webrender.all", true);
+user_pref("webgl.force-enabled", true);
+// a container with no internet: stop the background services retrying
+user_pref("app.normandy.enabled", false);
+user_pref("dom.push.connection.enabled", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("services.settings.server", "http://localhost:1/");
+user_pref("browser.safebrowsing.update.enabled", false);
