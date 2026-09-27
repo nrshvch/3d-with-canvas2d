@@ -1,0 +1,635 @@
+<meta charset="utf-8">
+<title>canvas2d image sources: drawImage vs pattern, img vs ImageBitmap vs canvas</title>
+<style>
+  body { background:#14141a; color:#d8d8e0; font:12px/1.4 ui-monospace,Consolas,monospace; margin:10px; }
+  #status { color:#fd8; }
+</style>
+<div id="status">booting…</div>
+<pre id="out"></pre>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// imagepage.html -- two questions §4.7 left open (§4.13, T75-T77).
+//
+// 1. SPRITES.  §4.7 compares clip + drawImage against a pattern fill for a
+//    textured TRIANGLE.  A sprite is the other case: a screen-aligned rect cut
+//    out of an atlas, where drawImage needs no clip at all.  Part S prices
+//      drawImage(src, sx,sy,64,64, dx,dy,64,64)                 per sprite
+//      setTransform(1,0,0,1,dx-sx,dy-sy); fillRect(sx,sy,64,64) per sprite,
+//        fillStyle = one CanvasPattern of the atlas (the §4.7 recipe on a rect)
+//    both unscaled and rotated + scaled 1.5x, and part X measures whether
+//    either samples outside the sprite's cell -- a pattern has no source
+//    rect, so it is the one expected to bleed the neighbouring atlas cell.
+//
+// 2. SOURCE TYPE.  Every other page textures from a canvas built in code.
+//    Here the same 512x512 atlas reaches the draw call as
+//      img-png  HTMLImageElement from a PNG blob
+//      img-jpg  HTMLImageElement from a JPEG blob (q 0.92)
+//      bitmap   createImageBitmap(png blob)
+//      canvas   a canvas the decoded PNG was drawn into once
+//    Parts S and T run every recipe on every source (A2 sustained, A3 raster).
+//    Part F is the first-use cost (A10): a FRESH 2048x2048 source and a fresh
+//    target per trial, then draw + 1 px read -- decode and upload are paid on
+//    first use, and a steady-state loop never sees them.
+//
+// 3. THE 3D-ENGINE CASE (§4.14, T78-T79).  Parts S and T use one atlas that
+//    never repeats.  A 3D engine textures surfaces with small per-material
+//    textures that TILE across a face.  Part M draws a perspective scene of
+//    textured quads (S22): a floor and two walls, eight 128x128 materials,
+//    each face tiling its material REP x REP times, and prices
+//      pattern 'repeat'     one repeating CanvasPattern per material, the UV
+//                           -> screen map on the context, path in texel space
+//      clip + pre-tiled     clip to the face, drawImage of a canvas the
+//                           material was tiled into REP x REP at load
+//      clip + per tile      clip to the face, one drawImage per repetition
+//    from three source kinds per material: img-png, bitmap, and a small
+//    128x128 canvas the image was drawn into.  ?rep=N sets REP (default 4).
+//    Part B sweeps the image SIZE (256..4096) for img-png / bitmap / canvas,
+//    16 whole-image drawImage calls per frame, to find where an <img> starts
+//    costing more per draw than its bitmap (M6 Chrome: 13-14x at 2048).
+//
+// Parts: S sprites, T textured triangles, X fidelity, F first use,
+//        M materials, B size sweep.
+// ?parts=S,T,X,F,M,B  ?quick=1
+// ---------------------------------------------------------------------------
+const W = 1280, H = 720;
+const Q = new URLSearchParams(location.search);
+const TAG = Q.get('tag') || 'image';
+const QUICK = Q.get('quick') === '1';
+const PARTS = (Q.get('parts') || 'X,S,T,M,B,F').split(',');
+const out = document.getElementById('out'), statusEl = document.getElementById('status');
+const log = s => { out.textContent += s + '\n'; };
+const rp = (s, n) => { s = String(s); while (s.length < n) s = ' ' + s; return s; };
+const pd = (s, n) => { s = String(s); while (s.length < n) s += ' '; return s; };
+const nextFrame = () => new Promise(r => requestAnimationFrame(r));
+const RES = { env: { tag: TAG, ua: navigator.userAgent }, micro: [], sprite: [], tri: [], fidelity: [], first: [], mat: [], size: [] };
+// §8.1 / T71: not an opaque clear.  ?sustbg=opaque swaps in the opaque one,
+// and ?noop=1 replaces every workload with nothing, leaving only the clears:
+// the two controls that place a Firefox demotion seen during A2.
+const SUST_BG = Q.get('sustbg') === 'opaque' ? '#101014' : 'rgba(16,16,20,0.996)';
+const NOOP = Q.get('noop') === '1';
+// ?detached=1 never attaches the part S/T target: the control for a demotion
+// caused by presenting the canvas rather than by drawing it.
+// (A detached canvas may not reach EndFrame every frame, so its verdict can
+// read 'soft' before the first presented frame; read v1/v, not v0.)
+const DETACHED = Q.get('detached') === '1';
+
+function mk(w, h, opts) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  return { c, ctx: c.getContext('2d', opts || { alpha: false }) };
+}
+function median(a) { const b = a.slice().sort((x, y) => x - y); return b[b.length >> 1]; }
+
+// --- acceleration indicator (A7), as isopage.html --------------------------
+let probe = null, INDICATOR = false;
+function accelFraction(canvas) {
+  if (!probe) probe = mk(32, 32, { alpha: false, willReadFrequently: true });
+  const p = probe.ctx;
+  p.fillStyle = '#000'; p.fillRect(0, 0, 32, 32);
+  p.drawImage(canvas, canvas.width - 16, 0, 16, 16, 0, 0, 16, 16);
+  const d = p.getImageData(3, 3, 10, 10).data;
+  let g = 0; for (let i = 0; i < d.length; i += 4) if (d[i] < 60 && d[i + 1] > 190 && d[i + 2] < 60) g++;
+  return g / 100;
+}
+function verdict(c) { return INDICATOR ? (accelFraction(c) > 0.8 ? 'ACCEL' : 'soft') : '-'; }
+
+// --- the content -----------------------------------------------------------
+// Opaque, and textured enough that PNG does not compress it to nothing and
+// JPEG has something to lose: a gradient, a disc and hashed noise per cell.
+function hash(x, y) { let h = (x * 374761393 + y * 668265263) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; return (h ^ (h >>> 16)) & 255; }
+function paintAtlas(size, cell) {
+  const t = mk(size, size, { alpha: false, willReadFrequently: true });
+  const img = t.ctx.createImageData(size, size), d = img.data;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const cx = (x / cell) | 0, cy = (y / cell) | 0, lx = x % cell, ly = y % cell;
+    const k = cx * 7 + cy * 13, n = hash(x, y) >> 3;
+    const r2 = (lx - cell / 2) ** 2 + (ly - cell / 2) ** 2, disc = r2 < (cell * 0.35) ** 2;
+    const o = (y * size + x) * 4;
+    d[o]     = disc ? (200 + n) & 255 : (k * 29 + lx * 2 + n) & 255;
+    d[o + 1] = disc ? (40 + k * 11) & 255 : (k * 53 + ly * 2 + n) & 255;
+    d[o + 2] = disc ? (90 + n) : (255 - k * 17 - n) & 255;
+    d[o + 3] = 255;
+  }
+  t.ctx.putImageData(img, 0, 0);
+  return t.c;
+}
+const toBlob = (c, type, q) => new Promise(r => c.toBlob(r, type, q));
+function loadImg(blob) {
+  return new Promise((res, rej) => {
+    const im = new Image(); im.onload = () => res(im); im.onerror = rej;
+    im.src = URL.createObjectURL(blob);
+  });
+}
+async function makeSources(size, cell) {
+  const painted = paintAtlas(size, cell);
+  const png = await toBlob(painted, 'image/png'), jpg = await toBlob(painted, 'image/jpeg', 0.92);
+  const imgPng = await loadImg(png), imgJpg = await loadImg(jpg);
+  const bitmap = await createImageBitmap(png);
+  const cv = mk(size, size); cv.ctx.drawImage(imgPng, 0, 0);
+  return { list: [['img-png', imgPng], ['img-jpg', imgJpg], ['bitmap', bitmap], ['canvas', cv.c]],
+           png, jpg, painted };
+}
+
+// --- workloads -------------------------------------------------------------
+const ATLAS = 512, CELL = 64, NCELL = ATLAS / CELL;
+const NSPR = 2000;
+let STRIDE = CELL;                                    // part X widens it to put a gutter between cells
+const SPR = new Float32Array(NSPR * 4);                // dx, dy, cell, angle
+(function () {
+  let s = 12345; const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < NSPR; i++) {
+    SPR[i * 4] = Math.floor(rnd() * (W - CELL)); SPR[i * 4 + 1] = Math.floor(rnd() * (H - CELL));
+    SPR[i * 4 + 2] = Math.floor(rnd() * NCELL * NCELL); SPR[i * 4 + 3] = rnd() * 6.2832;
+  }
+})();
+
+const SPRITE = {
+  'drawImage':           (ctx, src) => {
+    for (let i = 0; i < NSPR; i++) {
+      const c = SPR[i * 4 + 2], sx = (c % NCELL) * STRIDE, sy = ((c / NCELL) | 0) * STRIDE;
+      ctx.drawImage(src, sx, sy, CELL, CELL, SPR[i * 4], SPR[i * 4 + 1], CELL, CELL);
+    }
+  },
+  'pattern fillRect':    (ctx, src, pat) => {
+    ctx.fillStyle = pat;
+    for (let i = 0; i < NSPR; i++) {
+      const c = SPR[i * 4 + 2], sx = (c % NCELL) * STRIDE, sy = ((c / NCELL) | 0) * STRIDE;
+      ctx.setTransform(1, 0, 0, 1, SPR[i * 4] - sx, SPR[i * 4 + 1] - sy);
+      ctx.fillRect(sx, sy, CELL, CELL);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  },
+  'drawImage rot+1.5x':  (ctx, src) => {
+    for (let i = 0; i < NSPR; i++) {
+      const c = SPR[i * 4 + 2], sx = (c % NCELL) * STRIDE, sy = ((c / NCELL) | 0) * STRIDE;
+      const a = SPR[i * 4 + 3], k = 1.5, ca = Math.cos(a) * k, sa = Math.sin(a) * k;
+      ctx.setTransform(ca, sa, -sa, ca, SPR[i * 4] + 32, SPR[i * 4 + 1] + 32);
+      ctx.drawImage(src, sx, sy, CELL, CELL, -32, -32, CELL, CELL);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  },
+  'pattern rot+1.5x':    (ctx, src, pat) => {
+    ctx.fillStyle = pat;
+    for (let i = 0; i < NSPR; i++) {
+      const c = SPR[i * 4 + 2], sx = (c % NCELL) * STRIDE, sy = ((c / NCELL) | 0) * STRIDE;
+      const a = SPR[i * 4 + 3], k = 1.5, ca = Math.cos(a) * k, sa = Math.sin(a) * k;
+      // screen = R * (p - (sx+32, sy+32)) + (dx+32, dy+32)
+      const ox = -(sx + 32), oy = -(sy + 32);
+      ctx.setTransform(ca, sa, -sa, ca, SPR[i * 4] + 32 + ca * ox - sa * oy, SPR[i * 4 + 1] + 32 + sa * ox + ca * oy);
+      ctx.fillRect(sx, sy, CELL, CELL);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+};
+
+// §4.7's two recipes on 1152 triangles: a 24x24 grid of quads, the whole
+// atlas mapped onto a rotated, sheared 900x560 parallelogram-ish mesh.
+const TN = 24, NTRI = TN * TN * 2;
+const TXY = new Float32Array(NTRI * 6), TUV = new Float32Array(NTRI * 6), TAFF = new Float32Array(NTRI * 6);
+(function () {
+  const P = (u, v) => {                                  // gentle bend so maps differ per triangle
+    const x = 190 + u * 900 + v * 120 + 30 * Math.sin(v * 3.1), y = 80 + v * 560 + u * 60 + 20 * Math.sin(u * 2.7);
+    return [x, y];
+  };
+  let t = 0;
+  for (let j = 0; j < TN; j++) for (let i = 0; i < TN; i++) {
+    const q = [[i, j], [i + 1, j], [i + 1, j + 1], [i, j + 1]];
+    for (const tri of [[0, 1, 2], [0, 2, 3]]) {
+      for (let k = 0; k < 3; k++) {
+        const [a, b] = q[tri[k]], p = P(a / TN, b / TN);
+        TXY[t * 6 + k * 2] = p[0]; TXY[t * 6 + k * 2 + 1] = p[1];
+        TUV[t * 6 + k * 2] = a / TN * ATLAS; TUV[t * 6 + k * 2 + 1] = b / TN * ATLAS;
+      }
+      // affine uv -> xy
+      const o = t * 6, u0 = TUV[o], v0 = TUV[o + 1], du1 = TUV[o + 2] - u0, dv1 = TUV[o + 3] - v0, du2 = TUV[o + 4] - u0, dv2 = TUV[o + 5] - v0;
+      const dx1 = TXY[o + 2] - TXY[o], dy1 = TXY[o + 3] - TXY[o + 1], dx2 = TXY[o + 4] - TXY[o], dy2 = TXY[o + 5] - TXY[o + 1];
+      const inv = 1 / (du1 * dv2 - du2 * dv1);
+      const a = (dx1 * dv2 - dx2 * dv1) * inv, c = (dx2 * du1 - dx1 * du2) * inv;
+      const b = (dy1 * dv2 - dy2 * dv1) * inv, d = (dy2 * du1 - dy1 * du2) * inv;
+      TAFF[o] = a; TAFF[o + 1] = b; TAFF[o + 2] = c; TAFF[o + 3] = d;
+      TAFF[o + 4] = TXY[o] - a * u0 - c * v0; TAFF[o + 5] = TXY[o + 1] - b * u0 - d * v0;
+      t++;
+    }
+  }
+})();
+const TRI = {
+  'clip + drawImage':    (ctx, src) => {
+    for (let t = 0; t < NTRI; t++) {
+      const o = t * 6;
+      ctx.save();
+      ctx.beginPath(); ctx.moveTo(TXY[o], TXY[o + 1]); ctx.lineTo(TXY[o + 2], TXY[o + 3]); ctx.lineTo(TXY[o + 4], TXY[o + 5]);
+      ctx.clip();
+      ctx.setTransform(TAFF[o], TAFF[o + 1], TAFF[o + 2], TAFF[o + 3], TAFF[o + 4], TAFF[o + 5]);
+      ctx.drawImage(src, 0, 0);
+      ctx.restore();
+    }
+  },
+  'pattern fill':        (ctx, src, pat) => {
+    ctx.fillStyle = pat;
+    for (let t = 0; t < NTRI; t++) {
+      const o = t * 6;
+      ctx.setTransform(TAFF[o], TAFF[o + 1], TAFF[o + 2], TAFF[o + 3], TAFF[o + 4], TAFF[o + 5]);
+      ctx.beginPath(); ctx.moveTo(TUV[o], TUV[o + 1]); ctx.lineTo(TUV[o + 2], TUV[o + 3]); ctx.lineTo(TUV[o + 4], TUV[o + 5]);
+      ctx.fill();
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+};
+
+
+// --- M: the 3D-engine case (S22) -------------------------------------------
+// A pinhole camera over a floor and two walls of unit quads.  Each quad gets
+// one affine UV -> screen map fitted at three corners (what a canvas2d 3D
+// engine does per face, §4.7) and tiles its material REP x REP times.
+const TEX = 128, NMAT = 8, REP = Math.max(1, +(Q.get('rep') || 4));
+const MQ = [];                                          // per face: 8 screen coords + material
+(function () {
+  const cam = [0, 1.6, -1], f = 620;
+  const P = (x, y, z) => { const zz = z - cam[2]; return zz < 0.3 ? null : [W / 2 + f * (x - cam[0]) / zz, H / 2 - f * (y - cam[1]) / zz]; };
+  const quads = [];
+  for (let z = 0; z < 14; z++) for (let x = -10; x < 10; x++) quads.push([[x, 0, z + 1], [x + 1, 0, z + 1], [x + 1, 0, z], [x, 0, z]]);          // floor
+  for (let z = 0; z < 14; z++) for (let y = 0; y < 5; y++) {
+    quads.push([[-4, y + 1, z + 1], [-4, y + 1, z], [-4, y, z], [-4, y, z + 1]]);                                        // left wall
+    quads.push([[4, y + 1, z], [4, y + 1, z + 1], [4, y, z + 1], [4, y, z]]);                                            // right wall
+  }
+  quads.sort((a, b) => (b[0][2] + b[2][2]) - (a[0][2] + a[2][2]));                                                      // back to front
+  for (const q of quads) {
+    const s = q.map(v => P(v[0], v[1], v[2]));
+    if (s.some(v => !v)) continue;
+    const xs = s.map(v => v[0]), ys = s.map(v => v[1]);
+    if (Math.max(...xs) < 0 || Math.min(...xs) > W || Math.max(...ys) < 0 || Math.min(...ys) > H) continue;
+    MQ.push({ s: [].concat(...s), m: (hash(q[0][0] + 20, q[0][2] * 3 + q[0][1]) % NMAT) });
+  }
+})();
+// affine from texel space (0..REP*TEX) to screen, fitted at corners 0, 1, 3
+const MAFF = new Float32Array(MQ.length * 6);
+MQ.forEach((q, i) => {
+  const L = REP * TEX, s = q.s;
+  const a = (s[2] - s[0]) / L, b = (s[3] - s[1]) / L, c = (s[6] - s[0]) / L, d = (s[7] - s[1]) / L;
+  MAFF.set([a, b, c, d, s[0], s[1]], i * 6);
+});
+// Every recipe covers the same outline: the affine image of the face's texel
+// square (corners 0, 1, 3 exact, the 4th where the affine map puts it), which
+// is the face a per-face affine engine draws.  Clipping to the true
+// perspective quad instead would leave the pre-tiled canvas short of it.
+function texelSquare(ctx) { const L = REP * TEX; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(L, 0); ctx.lineTo(L, L); ctx.lineTo(0, L); }
+const MATCASES = {
+  'pattern repeat': (ctx, set) => {
+    const L = REP * TEX;
+    for (let i = 0; i < MQ.length; i++) {
+      const o = i * 6;
+      ctx.fillStyle = set.pat[MQ[i].m];
+      ctx.setTransform(MAFF[o], MAFF[o + 1], MAFF[o + 2], MAFF[o + 3], MAFF[o + 4], MAFF[o + 5]);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(L, 0); ctx.lineTo(L, L); ctx.lineTo(0, L);
+      ctx.fill();
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  },
+  'clip + pre-tiled': (ctx, set) => {
+    for (let i = 0; i < MQ.length; i++) {
+      const o = i * 6;
+      ctx.save();
+      ctx.setTransform(MAFF[o], MAFF[o + 1], MAFF[o + 2], MAFF[o + 3], MAFF[o + 4], MAFF[o + 5]);
+      texelSquare(ctx); ctx.clip();
+      ctx.drawImage(set.tiled[MQ[i].m], 0, 0);
+      ctx.restore();
+    }
+  },
+  'clip + per tile': (ctx, set) => {
+    for (let i = 0; i < MQ.length; i++) {
+      const o = i * 6, src = set.src[MQ[i].m];
+      ctx.save();
+      ctx.setTransform(MAFF[o], MAFF[o + 1], MAFF[o + 2], MAFF[o + 3], MAFF[o + 4], MAFF[o + 5]);
+      texelSquare(ctx); ctx.clip();
+      for (let v = 0; v < REP; v++) for (let u = 0; u < REP; u++) ctx.drawImage(src, u * TEX, v * TEX);
+      ctx.restore();
+    }
+  }
+};
+async function makeMaterials() {
+  const kinds = { 'img-png': [], 'bitmap': [], 'canvas': [] };
+  for (let m = 0; m < NMAT; m++) {
+    const t = mk(TEX, TEX, { alpha: false, willReadFrequently: true });
+    // one cell of a per-material atlas: different colours per material
+    t.ctx.drawImage(paintAtlas(TEX * 4, TEX), (m % 4) * TEX, ((m / 4) | 0) * TEX, TEX, TEX, 0, 0, TEX, TEX);
+    const png = await toBlob(t.c, 'image/png'), im = await loadImg(png);
+    kinds['img-png'].push(im);
+    kinds['bitmap'].push(await createImageBitmap(png));
+    const cv = mk(TEX, TEX); cv.ctx.drawImage(im, 0, 0); kinds['canvas'].push(cv.c);
+  }
+  const probe = mk(1, 1).ctx;
+  return Object.entries(kinds).map(([n, src]) => [n, {
+    src,
+    pat: src.map(x => probe.createPattern(x, 'repeat')),
+    tiled: src.map(x => { const t = mk(TEX * REP, TEX * REP);
+      for (let v = 0; v < REP; v++) for (let u = 0; u < REP; u++) t.ctx.drawImage(x, u * TEX, v * TEX);
+      return t.c; })
+  }]);
+}
+
+// --- B: image size sweep (S23) ----------------------------------------------
+const SIZES = (Q.get('sizes') || '256,512,1024,2048,4096').split(',').map(Number);
+const SIZECASES = {
+  '16 x drawImage': (ctx, src) => {
+    const w = src.width, h = src.height;
+    for (let k = 0; k < 16; k++) ctx.drawImage(src, 0, 0, w, h, (k & 3) * 320, (k >> 2) * 180, 320, 180);
+  }
+};
+async function sizeSweep() {
+  for (const n of SIZES) {
+    const painted = paintAtlas(n, Math.max(16, n / 8));
+    const png = await toBlob(painted, 'image/png'), im = await loadImg(png);
+    await im.decode();
+    const bm = await createImageBitmap(png), cv = mk(n, n); cv.ctx.drawImage(im, 0, 0);
+    const sink = [];
+    await priceCases('B: ' + n + 'x' + n + ' image, 16 draws per frame', SIZECASES,
+                     [['img-png', im], ['bitmap', bm], ['canvas', cv.c]], sink);
+    for (const r of sink) RES.size.push(Object.assign({ size: n }, r));
+    bm.close();
+  }
+}
+
+// --- axes ------------------------------------------------------------------
+// A1 record: min of rounds.  A3 raster: willReadFrequently + 1 px read, min.
+function minRounds(fn, rounds, iters) {
+  let best = Infinity;
+  for (let r = 0; r < rounds; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) fn();
+    best = Math.min(best, (performance.now() - t0) / iters);
+  }
+  return best;
+}
+// A2 sustained, per §8.1: a displayed canvas, >= 50 ms of draws per rAF
+// callback, total wall / (frames x reps), opened by the 0.996 clear.
+// reps is CALIBRATED on the rAF interval itself, not guessed from A1 or A3:
+// on a GPU the CPU raster time overstates the cost by 10-100x, and a guess
+// taken from it put one rep into a 10 ms frame, so the row read the display's
+// refresh rate instead of the workload (the M6 run of T75-T77).  Doubling
+// until one callback spans >= 50 ms keeps every row off the vsync floor.
+function rafInterval(draw, ctx, reps, frames) {
+  return new Promise(resolve => {
+    let t0 = 0, n = -1;
+    function step() {
+      for (let r = 0; r < reps; r++) { ctx.fillStyle = SUST_BG; ctx.fillRect(0, 0, W, H); draw(ctx); }
+      if (n < 0) { n = 0; t0 = performance.now(); requestAnimationFrame(step); return; }
+      if (++n >= frames) { resolve((performance.now() - t0) / n); return; }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+async function sustained(draw, ctx, estMs) {
+  let reps = Math.max(1, Math.ceil(50 / Math.max(estMs, 0.05)));
+  let calib = 0;
+  for (let k = 0; k < 12; k++) {
+    const iv = await rafInterval(draw, ctx, reps, 3);
+    if (iv >= 50 || reps >= 4096) break;
+    reps = Math.min(4096, Math.max(reps * 2, Math.ceil(reps * 60 / Math.max(iv, 1))));
+    calib++;
+  }
+  const budget = QUICK ? 1200 : 3500;
+  return new Promise(resolve => {
+    let t0 = 0, frames = 0, warm = 3;
+    function step(ts) {
+      for (let r = 0; r < reps; r++) { ctx.fillStyle = SUST_BG; ctx.fillRect(0, 0, W, H); draw(ctx); }
+      if (warm > 0) { if (--warm === 0) t0 = performance.now(); requestAnimationFrame(step); return; }
+      frames++;
+      const el = performance.now() - t0;
+      if (el > budget && frames >= 4) {
+        const perRaf = el / frames;
+        resolve({ ms: el / (frames * reps), reps, frames, perRafMs: perRaf, calib, floored: perRaf < 20 });
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+async function priceCases(label, cases, srcs, sink, patFor) {
+  patFor = patFor || ((ctx, src) => ctx.createPattern(src, 'no-repeat'));
+  log('\n-- ' + label + ' (ms per frame of the workload) --');
+  log(pd('recipe', 22) + pd('source', 10) + rp('A1 rec', 9) + rp('A2 sust', 10) + rp('A3 rast', 10) + rp('accel', 7));
+  const rast = mk(W, H, { alpha: false, willReadFrequently: true });
+  for (const name in cases) for (const [sname, src] of srcs) {
+    statusEl.textContent = label + ': ' + name + ' / ' + sname;
+    await nextFrame();
+    const f = NOOP ? () => {} : cases[name];
+    // fresh displayed target per case: demotion is per canvas and permanent (§3.2)
+    const tgt = mk(W, H);
+    tgt.c.style.cssText = 'position:fixed;right:4px;bottom:4px;width:320px;height:180px';
+    if (!DETACHED) document.body.appendChild(tgt.c);
+    const pat = patFor(tgt.ctx, src);
+    const draw = ctx => f(ctx, src, ctx === tgt.ctx ? pat : rastPat);
+    const rastPat = patFor(rast.ctx, src);
+    for (let i = 0; i < 2; i++) { draw(rast.ctx); rast.ctx.getImageData(0, 0, 1, 1); }
+    const ra = minRounds(() => { rast.ctx.fillStyle = '#101014'; rast.ctx.fillRect(0, 0, W, H); draw(rast.ctx); rast.ctx.getImageData(0, 0, 1, 1); }, QUICK ? 2 : 4, 2);
+    // A7 at each phase, so a demotion can be placed: after one presented
+    // frame of the workload, after the A1 loop, after A2
+    draw(tgt.ctx); await nextFrame(); await nextFrame();
+    const v0 = verdict(tgt.c);
+    for (let i = 0; i < 2; i++) draw(tgt.ctx);
+    const rec = minRounds(() => draw(tgt.ctx), QUICK ? 2 : 4, 3);
+    await nextFrame(); await nextFrame();
+    const v1 = verdict(tgt.c);
+    // reps sized on the larger of record and raster: record alone is blind to
+    // deferred work and would put a thousand draws in one callback
+    const s = await sustained(draw, tgt.ctx, Math.max(rec, ra));
+    const v = verdict(tgt.c);
+    tgt.c.remove();
+    sink.push({ recipe: name, source: sname, recMs: +rec.toFixed(3), sustMs: +s.ms.toFixed(3), reps: s.reps,
+                frames: s.frames, perRafMs: +s.perRafMs.toFixed(2), floored: s.floored,
+                rasterMs: +ra.toFixed(3), verdict: v, verdictFirst: v0, verdictAfterA1: v1 });
+    log(pd(name, 22) + pd(sname, 10) + rp(rec.toFixed(2), 9) + rp(s.ms.toFixed(2), 10) + rp(ra.toFixed(2), 10) + rp(v0 + '>' + v1 + '>' + v, 18) + (s.floored ? '  VSYNC-FLOORED' : ''));
+  }
+}
+
+// --- X: does a recipe sample outside the sprite's cell? ------------------
+// Two copies of the atlas with the cells spread to a 128 px stride: one with
+// a black gutter, one with a white one.  The cells are identical, so a pixel
+// that differs between the two renders was sampled OUTSIDE the cell -- bleed,
+// isolated from every other difference (edge antialiasing, filtering).  JPEG
+// is left out: it would smear the gutter into the cell.
+async function fidelity() {
+  log('\n-- X: pixels that change with the gutter colour (= sampled outside the cell) --');
+  log(pd('recipe', 22) + pd('source', 10) + rp('px>0', 8) + rp('px>16', 8) + rp('maxD', 6) + '  canvas');
+  const cellsFrom = paintAtlas(ATLAS, CELL), S2 = CELL * 2, A2 = NCELL * S2;
+  const gut = async bg => {
+    const t = mk(A2, A2); t.ctx.fillStyle = bg; t.ctx.fillRect(0, 0, A2, A2);
+    for (let c = 0; c < NCELL * NCELL; c++) {
+      const x = (c % NCELL) * CELL, y = ((c / NCELL) | 0) * CELL;
+      t.ctx.drawImage(cellsFrom, x, y, CELL, CELL, x * 2, y * 2, CELL, CELL);
+    }
+    const png = await toBlob(t.c, 'image/png');
+    return [['img-png', await loadImg(png)], ['bitmap', await createImageBitmap(png)], ['canvas', t.c]];
+  };
+  const black = await gut('#000'), white = await gut('#fff');
+  // Two backends: 'cpu' is a willReadFrequently canvas (§8.1: forced onto
+  // the CPU rasteriser), 'default' is a displayed canvas with the engine's
+  // default backend -- the GPU where there is one -- read back only after a
+  // frame has presented it.  Bleed is a property of the sampler, and the two
+  // backends sample differently.
+  let BACKEND = 'cpu';
+  const render = async (fn, src) => {
+    const t = mk(W, H, BACKEND === 'cpu' ? { alpha: false, willReadFrequently: true } : { alpha: false });
+    if (BACKEND !== 'cpu') { t.c.style.cssText = 'position:fixed;right:4px;bottom:4px;width:320px;height:180px'; document.body.appendChild(t.c); }
+    t.ctx.fillStyle = '#808080'; t.ctx.fillRect(0, 0, W, H);
+    fn(t.ctx, src, t.ctx.createPattern(src, 'no-repeat'));
+    if (BACKEND !== 'cpu') { await nextFrame(); await nextFrame(); }
+    const d = t.ctx.getImageData(0, 0, W, H).data;
+    t.c.remove();
+    return d;
+  };
+  STRIDE = S2;
+  for (const be of ['cpu', 'default']) { BACKEND = be;
+  for (const name in SPRITE) for (let k = 0; k < black.length; k++) {
+    const a = await render(SPRITE[name], black[k][1]), b = await render(SPRITE[name], white[k][1]);
+    let n0 = 0, n16 = 0, mx = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      const d = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2]));
+      if (d > 0) n0++; if (d > 16) n16++; if (d > mx) mx = d;
+    }
+    RES.fidelity.push({ recipe: name, source: black[k][0], backend: be, px0: n0, px16: n16, maxD: mx });
+    log(pd(name, 22) + pd(black[k][0], 10) + rp(n0, 8) + rp(n16, 8) + rp(mx, 6) + '  ' + be);
+  }
+  }
+  STRIDE = CELL;
+}
+
+// --- F: first use (A10) ----------------------------------------------------
+// Per trial a FRESH source from the same bytes and a FRESH displayed target.
+//   prepMs    wall time of the async preparation (load / decode() /
+//             createImageBitmap) -- off the main thread where the engine can
+//   blockMs   main-thread time the preparation itself held (canvas: the
+//             drawImage that copies the image in)
+//   firstMs   first draw of the source, scaled to fill the target (or its
+//             top-left 1280x720 at 1:1, where marked), + 1 px read
+//   secondMs  the same again: the steady-state control
+// All synchronous spans are what a frame would feel; prepMs is not.
+async function firstUse() {
+  const N = 2048;
+  log('\n-- F: first use of a fresh ' + N + 'x' + N + ' source (median of trials, ms) --');
+  log(pd('source', 26) + rp('prep', 8) + rp('block', 8) + rp('first', 8) + rp('second', 8) + rp('accel', 7));
+  const painted = paintAtlas(N, 256);
+  const png = await toBlob(painted, 'image/png'), jpg = await toBlob(painted, 'image/jpeg', 0.92);
+  RES.env.firstPngBytes = png.size; RES.env.firstJpgBytes = jpg.size;
+  const kinds = {
+    'img-png (onload only)':   async () => ({ src: await loadImg(png), block: 0 }),
+    'img-png + decode()':      async () => { const im = await loadImg(png); await im.decode(); return { src: im, block: 0 }; },
+    'img-jpg (onload only)':   async () => ({ src: await loadImg(jpg), block: 0 }),
+    'img-jpg + decode()':      async () => { const im = await loadImg(jpg); await im.decode(); return { src: im, block: 0 }; },
+    'img-png, 1:1 draw':       async () => ({ src: await loadImg(png), block: 0, unscaled: true }),
+    'img-png + decode(), 1:1': async () => { const im = await loadImg(png); await im.decode(); return { src: im, block: 0, unscaled: true }; },
+    'bitmap (png blob)':       async () => ({ src: await createImageBitmap(png), block: 0 }),
+    'bitmap (jpg blob)':       async () => ({ src: await createImageBitmap(jpg), block: 0 }),
+    'bitmap (from decoded img)': async () => { const im = await loadImg(png); await im.decode(); return { src: await createImageBitmap(im), block: 0 }; },
+    'canvas (img drawn in)':   async () => {
+      const im = await loadImg(png); const t = mk(N, N);
+      const b0 = performance.now(); t.ctx.drawImage(im, 0, 0); t.ctx.getImageData(0, 0, 1, 1);
+      return { src: t.c, block: performance.now() - b0 };
+    }
+  };
+  const trials = QUICK ? 3 : 7;
+  for (const k in kinds) {
+    statusEl.textContent = 'F: ' + k;
+    const pr = [], bl = [], f1 = [], f2 = [];
+    let v = '-';
+    for (let t = 0; t < trials; t++) {
+      await nextFrame();
+      const p0 = performance.now();
+      const { src, block, unscaled } = await kinds[k]();
+      const sw = unscaled ? W : N, sh = unscaled ? H : N;
+      pr.push(performance.now() - p0); bl.push(block);
+      const tgt = mk(W, H);
+      tgt.c.style.cssText = 'position:fixed;right:4px;bottom:190px;width:320px;height:180px';
+      document.body.appendChild(tgt.c);
+      tgt.ctx.fillStyle = '#101014'; tgt.ctx.fillRect(0, 0, W, H);
+      tgt.ctx.getImageData(0, 0, 1, 1);
+      await nextFrame();
+      let t0 = performance.now();
+      tgt.ctx.drawImage(src, 0, 0, sw, sh, 0, 0, W, H); tgt.ctx.getImageData(0, 0, 1, 1);
+      f1.push(performance.now() - t0);
+      t0 = performance.now();
+      tgt.ctx.drawImage(src, 0, 0, sw, sh, 0, 0, W, H); tgt.ctx.getImageData(0, 0, 1, 1);
+      f2.push(performance.now() - t0);
+      if (t === trials - 1) { await nextFrame(); await nextFrame(); v = verdict(tgt.c); }
+      tgt.c.remove();
+      if (src.close) src.close();
+    }
+    const r = { source: k, prepMs: +median(pr).toFixed(2), blockMs: +median(bl).toFixed(2),
+                firstMs: +median(f1).toFixed(2), secondMs: +median(f2).toFixed(2), trials, verdict: v };
+    RES.first.push(r);
+    log(pd(k, 26) + rp(r.prepMs, 8) + rp(r.blockMs, 8) + rp(r.firstMs, 8) + rp(r.secondMs, 8) + rp(v, 7));
+  }
+}
+
+async function main() {
+  const lease = await fetch('/lease?tag=' + encodeURIComponent(TAG)).then(r => r.json()).catch(() => ({ granted: true }));
+  if (!lease.granted) { statusEl.textContent = 'duplicate instance'; return; }
+  setInterval(() => fetch('/beat?tag=' + encodeURIComponent(TAG)).catch(() => {}), 5000);
+  log('TAG ' + TAG + '\n' + navigator.userAgent);
+  // indicator: a control canvas that only ever gets one fillRect
+  // 256 px: Gecko never accelerates a canvas under gfx.canvas.accelerated.
+  // min-size (128 by default), so a smaller control reads 'false' on every
+  // machine -- the M6 run's indicator probe found exactly that at 64 px.
+  { const c = mk(256, 256); c.c.style.cssText = 'position:fixed;left:-500px'; document.body.appendChild(c.c);
+    c.ctx.fillStyle = '#123'; c.ctx.fillRect(0, 0, 256, 256); await nextFrame(); await nextFrame();
+    INDICATOR = accelFraction(c.c) > 0.8; c.c.remove(); }
+  RES.env.indicator = INDICATOR;
+  log('acceleration indicator on control canvas: ' + INDICATOR);
+
+  const S = await makeSources(ATLAS, CELL);
+  RES.env.atlasPngBytes = S.png.size; RES.env.atlasJpgBytes = S.jpg.size;
+  log('atlas ' + ATLAS + 'x' + ATLAS + ': png ' + S.png.size + ' B, jpg ' + S.jpg.size + ' B');
+  // identity of the decoded pixels, so a timing gap cannot be a content gap
+  {
+    const g = s => { const t = mk(ATLAS, ATLAS, { alpha: false, willReadFrequently: true }); t.ctx.drawImage(s, 0, 0); return t.ctx.getImageData(0, 0, ATLAS, ATLAS).data; };
+    const base = g(S.list[0][1]);
+    for (const [n, s] of S.list) {
+      const d = g(s); let diff = 0, mx = 0;
+      for (let i = 0; i < d.length; i++) { const e = Math.abs(d[i] - base[i]); if (e) diff++; if (e > mx) mx = e; }
+      RES.micro.push({ name: 'decoded vs img-png: ' + n, channelsDiffering: diff, maxDelta: mx });
+      log('decoded ' + pd(n, 8) + ' vs img-png: ' + diff + ' channels differ, max ' + mx);
+    }
+  }
+  for (const p of PARTS) {
+    if (p === 'X') await fidelity();
+    if (p === 'S') await priceCases('S: ' + NSPR + ' sprites 64x64 from a 512x512 atlas', SPRITE, S.list, RES.sprite);
+    if (p === 'T') await priceCases('T: ' + NTRI + ' textured triangles, the 512x512 atlas', TRI, S.list, RES.tri);
+    if (p === 'F') await firstUse();
+    if (p === 'M') {
+      RES.env.matFaces = MQ.length; RES.env.matRep = REP;
+      const sets = await makeMaterials();
+      // the three recipes must draw the same picture, or a timing gap is a content gap
+      {
+        const shot = fn => { const t = mk(W, H, { alpha: false, willReadFrequently: true });
+          t.ctx.fillStyle = '#101014'; t.ctx.fillRect(0, 0, W, H); fn(t.ctx, sets[2][1]); return t.ctx.getImageData(0, 0, W, H).data; };
+        const ref = shot(MATCASES['pattern repeat']);
+        let area = 0; for (const q of MQ) { const v = q.s; area += Math.abs((v[4] - v[0]) * (v[7] - v[3]) - (v[6] - v[2]) * (v[5] - v[1])) / 2; }
+        RES.env.matMeanQuadPx = Math.round(area / MQ.length);
+        let lit = 0; for (let i = 0; i < ref.length; i += 4) if (ref[i] !== 16 || ref[i + 1] !== 16 || ref[i + 2] !== 20) lit++;
+        RES.env.matCoverage = +(lit / (W * H)).toFixed(3);
+        for (const n of ['clip + pre-tiled', 'clip + per tile']) {
+          const d = shot(MATCASES[n]); let se = 0, n16 = 0;
+          for (let i = 0; i < d.length; i += 4) { let m = 0; for (let c = 0; c < 3; c++) { const e = d[i + c] - ref[i + c]; se += e * e; m = Math.max(m, Math.abs(e)); } if (m > 16) n16++; }
+          const r = { name: 'M picture vs pattern repeat: ' + n, rmse: +Math.sqrt(se / (W * H * 3)).toFixed(3), px16: n16 };
+          RES.micro.push(r); log(r.name + ': rmse ' + r.rmse + ', ' + n16 + ' px > 16');
+        }
+        log('S22: ' + MQ.length + ' quads, mean ' + RES.env.matMeanQuadPx + ' px2, coverage ' + RES.env.matCoverage);
+      }
+      await priceCases('M: ' + MQ.length + ' textured quads, ' + NMAT + ' materials ' + TEX + 'px, each tiled ' + REP + 'x' + REP,
+                       MATCASES, sets, RES.mat, () => null);
+    }
+    if (p === 'B') await sizeSweep();
+  }
+  statusEl.textContent = 'DONE';
+  RES.micro.push({ name: 'done' });
+  await fetch('/result?tag=' + encodeURIComponent(TAG), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(RES) });
+  log('\nposted as ' + TAG);
+}
+window.addEventListener('load', () => setTimeout(() => main().catch(e => {
+  statusEl.textContent = 'ERROR ' + e; log(String(e) + '\n' + e.stack);
+  fetch('/result?tag=' + encodeURIComponent(TAG), { method: 'POST', body: JSON.stringify({ error: String(e), micro: [{}] }) });
+}), 150));
+</script>

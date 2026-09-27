@@ -197,6 +197,10 @@ so a figure cannot drift from the algorithm it illustrates.
   through `bench/wgr.mjs`; timings read from the committed `bench/out/`
   results; shapes from `pathshape.js`'s `tierShapes()` / `mergeLayouts()`, the
   same geometry the page timed)
+- `bench/imagefigs.mjs` → `assets/image-sources.svg` and
+  `texture-materials.svg` (every bar read from the committed `bench/out/`
+  results of `bench/imagepage.html`: `*-img-m4.json`, and M6's
+  `*-img2-gpu-r*`, `*-imgM-gpu-r*`, `*-imgM1-gpu-r1` and `*-imgB-gpu-r*`)
 
 One script per figure family, so re-running one cannot overwrite another. Keep
 the palette in `C` (it has to read on a light or a dark page), keep text as SVG

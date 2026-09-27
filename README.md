@@ -1,6 +1,6 @@
 # Guide for fastest Canvas 2D rendering
 
-**Version 1.61 · circa September 2026**
+**Version 2.02 · circa September 2026**
 
 > ### About this document, and how much to trust it
 >
@@ -42,7 +42,7 @@
 >
 > **The fixture.** Chromium 152 (Microsoft Edge — Blink and Skia; *not* WebKit)
 > and Firefox 155, on Windows 11, 8 cores, discrete GPU, plus Node with no
-> browser for counts-only and software-reference work. §3.5 and §4.12 add a
+> browser for counts-only and software-reference work. §3.5, §4.12 and §4.13 add a
 > second machine with **no GPU at all** — Chromium 141 and Firefox 156 in a
 > Linux container — and Firefox 156's own path tessellators compiled to run
 > in Node; and a third, **M6**, an Apple M4 MacBook Air with a real GPU —
@@ -50,8 +50,9 @@
 > Ganesh, and Firefox 156.0.1 — which re-measured what the container could
 > not. Every entry says which machine it used. Full detail in §10.1.
 > **WebKit / Safari is measured on one machine only** — M6's Safari 26.6.2,
-> for the path-shape results of §4.12 (T72) — so §3 is Blink plus Gecko, and
-> §3.4 is explicitly source-read rather than measured.
+> for the path-shape results of §4.12 (T72) and the sprite, texture and image
+> results of §4.13 and §4.14 (T75–T79) — so §3 is Blink plus Gecko, and §3.4's mechanism
+> is source-read, with §4.13 measuring its consequence.
 > Browser internals move: a §3 claim is pinned to those two versions and to the
 > date above, and the pref names in §1.11 and §3.2 are the first thing that will
 > go stale.
@@ -127,12 +128,14 @@ that may already exist.
   - [1.9 Rules for overdraw](#19-rules-for-overdraw)
   - [1.10 Rules for a multi-pass 3D pipeline](#110-rules-for-a-multi-pass-3d-pipeline)
   - [1.11 Rules for the acceleration cliff](#111-rules-for-the-acceleration-cliff)
+  - [1.12 Rules for textures and images](#112-rules-for-textures-and-images)
+  - [1.13 Per-browser tuning, only after the all-rounder](#113-per-browser-tuning-only-after-the-all-rounder)
 - [**2. Measuring canvas2d without lying to yourself**](#2-measuring-canvas2d-without-lying-to-yourself) — why one timer is not enough, and what lies
 - [**3. What the engines actually do**](#3-what-the-engines-actually-do) — Skia, Gecko and Graphite, from their own source
   - [3.1 Chromium / Skia (Ganesh)](#31-chromium--skia-ganesh)
   - [3.2 Firefox / Gecko — the demotion cliff](#32-firefox--gecko--the-demotion-cliff)
   - [3.3 Chromium / Skia Graphite — the GPU depth buffer arrives](#33-chromium--skia-graphite--the-gpu-depth-buffer-arrives)
-  - [3.4 WebKit / Safari — read from the source, measured by nobody here](#34-webkit--safari--read-from-the-source-measured-by-nobody-here)
+  - [3.4 WebKit / Safari — read from the source, measured on one machine](#34-webkit--safari--read-from-the-source-measured-on-one-machine)
   - [3.5 Three tessellators: what the backend does with your path](#35-three-tessellators-what-the-backend-does-with-your-path)
 - [**4. The algorithm**](#4-the-algorithm) — batching, seams, textures, gaps, overdraw
   - [4.1 Reordering under an occupancy grid](#41-reordering-under-an-occupancy-grid)
@@ -147,6 +150,8 @@ that may already exist.
   - [4.10 Fog](#410-fog)
   - [4.11 Colour redundancy: the prep step](#411-colour-redundancy-the-prep-step)
   - [4.12 Feeding the tessellator: path shape at batcher scale](#412-feeding-the-tessellator-path-shape-at-batcher-scale)
+  - [4.13 Sprites and image sources](#413-sprites-and-image-sources)
+  - [4.14 Textured 3D faces: tiled materials](#414-textured-3d-faces-tiled-materials)
 - [**5. Measurements**](#5-measurements) — the numbers, GPU time included
   - [5.1 End-to-end, GPU included (the number that counts)](#51-end-to-end-gpu-included-the-number-that-counts)
   - [5.1b Edge cancellation, isolated](#51b-edge-cancellation-isolated)
@@ -174,6 +179,8 @@ that may already exist.
   - [6.15 A band fix that trusts the polygon behind the corner](#615-a-band-fix-that-trusts-the-polygon-behind-the-corner)
   - [6.16 On Firefox, the seam stroke costs a second tessellation](#616-on-firefox-the-seam-stroke-costs-a-second-tessellation)
   - [6.17 On Firefox, staying accelerated can be the slow path](#617-on-firefox-staying-accelerated-can-be-the-slow-path)
+  - [6.18 A raw `<img>` decodes inside the first frame that draws it](#618-a-raw-img-decodes-inside-the-first-frame-that-draws-it)
+  - [6.19 Two texture recipes that look harmless and cost 8–170×](#619-two-texture-recipes-that-look-harmless-and-cost-8170)
 - [**7. Checklist**](#7-checklist) — setup, every frame, never, verify
 - [**8. The measurement apparatus**](#8-the-measurement-apparatus) — how to measure this yourself, in algorithms
   - [8.1 The three axes, and how to force each one](#81-the-three-axes-and-how-to-force-each-one)
@@ -291,13 +298,14 @@ that may already exist.
    subset fragments into single edges (0.48–0.90 free ends per band edge,
    counted) and is not measured end to end.
 
-8b. **Textured? Two changes.** Replace `clip` + `drawImage` with a
-   `CanvasPattern` fill whose path is in texture space — 4–8× cheaper, and it
-   makes texturing an ordinary `fill()` so every rule above still applies. Then
-   merge coplanar triangles under one affine map, but only while an ε-pixel fit
-   test allows it: `setTransform` is affine and a perspective plane is a
-   homography (§4.7). Merging a quad's two triangles is strictly better —
-   2.8–4.1× faster *and* more accurate, because it removes the diagonal crease.
+8b. **Textured? Use the pattern recipe.** Replace `clip` + `drawImage` with a
+   `CanvasPattern` fill whose path is in texture space. It is 4–8× cheaper,
+   and it makes texturing an ordinary `fill()`, so every rule above still
+   applies. Then merge coplanar triangles under one affine map, but only while
+   an ε-pixel fit test allows it: `setTransform` is affine and a perspective
+   plane is a homography (§4.7). Merging a quad's two triangles is strictly
+   better, 2.8–4.1× faster *and* more accurate, because it removes the
+   diagonal crease. For images, sprites and tiled materials, see rule 13.
 
 9. **Cull the faces that own no pixel.** A painter's-algorithm renderer already
    owns a total depth order, so occlusion needs no depth *values*: walk the
@@ -427,6 +435,23 @@ software rasteriser** that demotion would have given them (§6.17).
      band's ink at a pinch or a sliver (§6.15). The default takes the exact
      cases and skips pinches.
 
+13. **Images and textures, the all-rounder** (§1.12, §4.13, §4.14):
+   - `await createImageBitmap(blob)` at load. A raw `<img>` stalls its first
+     frame 16.6–137 ms, and `img.decode()` does not prevent that on Chromium.
+   - Draw each bitmap once into a canvas, and use that canvas as the source of
+     every pattern.
+   - Texture 3D faces with a `'repeat'` pattern. It ties on Chrome, wins by
+     ≥ 39× on Firefox and loses 1.1–1.8× on Safari.
+   - Draw sprites with `drawImage` and a source rect, never a pattern: a
+     pattern sprite costs 5.9–6.9× on Chrome and 108–169× on Safari.
+   - Never tile with one `drawImage` per repetition (7.8–17×).
+   - Pad atlases drawn rotated or scaled.
+
+**Per-browser tuning is a separate, later step** (§1.13). Rules 1–13 are one
+configuration for every engine. A handful of overrides win on one engine only,
+such as a pre-tiled clip on Safari (1.11–1.80×). Take them after the
+all-rounder, and choose them by timing at startup, not by user-agent.
+
 Headline end-to-end results, GPU included, **stroke against stroke** — both
 sides hide their seams — and the batched side is also the more accurate one:
 
@@ -444,17 +469,22 @@ knot, 3.99 → **2.15** on the sphere. Fewer strokes, and a better picture.
 
 **One configuration does this on both**, and it is never slower than the
 baseline on either (§1.2). The engines differ enormously in *why* they are slow,
-but they reward the same extreme, so there is no browser branch to write. The
-only runtime decision is about your mesh, not the user's browser (§1.7).
+but they reward the same extreme, so the all-rounder has no browser branch.
+The only runtime decision it makes is about your mesh, not the user's browser
+(§1.7). The per-browser overrides of §1.13 are optional, and measured at
+runtime when taken.
 
 ---
 
 ## 1. The workflow
 
 This section is the part you can work from. Everything in it is a rule with a
-measurement behind it, and **none of it requires a browser check** — the
-configuration below is the fastest measured setting on every engine tested, and
-never slower than the naive baseline on any of them.
+measurement behind it. §1.1–§1.12 are **the all-rounder**: one configuration
+with no browser check, the fastest measured setting on every engine tested, or
+within 1.8× of it on the one engine where it is not first, and never slower
+than the naive baseline on any of them. §1.13 is the separate set of
+per-browser overrides, to apply only on top of the all-rounder and only by
+measurement.
 
 ### 1.1 The mental model: three cost centres, not one
 
@@ -880,6 +910,8 @@ Rules that follow:
    or `copy`, and the transformed rect must contain the whole canvas (§3.2). A
    clip left set from the previous pass silently costs you a whole-canvas
    preserve every frame.
+8. **Images: decode them before the frame, and keep them as canvases.** The
+   full rules are §1.12.
 
 ### 1.7 What decides whether to batch: the content, not the browser
 
@@ -1316,6 +1348,70 @@ than a hypothesis. Each step says what its answer rules out.
 
 The one thing not to do with these prefs is ship advice about them. They are
 diagnostic instruments; your users have the defaults.
+
+### 1.12 Rules for textures and images
+
+These are all-rounder rules. Each is the best measured choice with no browser
+check, or within 1.8× of the best on the one engine where it is not first
+(§4.13, §4.14).
+
+1. **Decode before the frame.** `await createImageBitmap(blob)` at load, for
+   every image. A raw `<img>` decodes inside its first draw, 16.6–137 ms of
+   main thread on every engine measured. `img.decode()` does not prevent that
+   on Chromium (§6.18).
+2. **Then draw each bitmap once into a canvas** (`alpha: false` if the art is
+   opaque) and keep the canvas as the source. For patterns a canvas is never
+   the slower source, and on Chrome's GPU canvas a 512² pattern from an
+   `<img>` or bitmap ran at CPU raster cost, 4.4–67× the canvas's. For
+   `drawImage` it avoids Chrome's 2.8–4.1× whole-`<img>` cost. It is 1.37–1.46×
+   dearer than an `<img>` only for Safari's sprites (§1.13).
+3. **Textured 3D faces: a `'repeat'` pattern, the UV → screen map on the
+   context, the path in texel space** (§4.7, §4.14). It ties with the best
+   recipe on Chrome, wins by ≥ 39× on Firefox's accelerated profile and
+   1.39–1.60× in software, and costs 1.11–1.40× on Safari (1.23–1.80× at one
+   texture per face). It is also an
+   ordinary `fill()`, so batching, edge cancellation and seam repair apply to
+   textured faces unchanged.
+4. **Merge coplanar faces under one affine map while an ε-pixel fit allows**
+   (§4.7). A quad's two triangles as one fill is 2.8–4.1× faster and more
+   accurate.
+5. **Sprites: `drawImage(src, sx,sy,w,h, dx,dy,w,h)`, never a pattern.** A
+   sprite has no clip for a pattern to remove, and the pattern costs 5.9–6.9×
+   on Chrome's GPU canvas and 108–169× on Safari (§4.13, §6.19).
+6. **Never tile with one `drawImage` per repetition**: 7.8–17.0× at 4 × 4
+   (§6.19).
+7. **Pad every atlas** whose cells are drawn rotated or scaled: extrude each
+   cell's border texels into a gutter of at least 1 px at the largest scale.
+   Most samplers bleed the neighbouring cell with either recipe (§4.13).
+8. **Keep sources and targets on the same side.** Never use a GPU canvas as
+   the source of a pattern drawn into a `willReadFrequently` one: that is a
+   readback per draw, 725–934 ms a frame measured on M6 (§4.13).
+
+### 1.13 Per-browser tuning, only after the all-rounder
+
+Everything in §1.1–§1.12 is one configuration for every engine. This section
+is the other set. Each item wins on one engine, and costs nothing or loses
+elsewhere. Take one only when that engine matters to you, and **choose it at
+runtime by timing both paths on a few real frames at startup** (§1.7), never
+from the user-agent string. A measured switch stays right when an engine
+changes. A UA branch goes stale silently.
+
+| engine | override | what it buys there | what it costs elsewhere |
+|---|---|---|---|
+| **Safari** | tiled materials as `clip` + a canvas pre-tiled at load instead of a `'repeat'` pattern | 1.11–1.80× (§4.14); the two draw measurably different pictures there (RMSE 11) | a tie on Chrome, ≥ 39× on accelerated Firefox |
+| **Safari** | `drawImage` sprites from the decoded `<img>` instead of its canvas | 1.37–1.46× (§4.13) | 2.8–4.1× for scaled whole-image draws on Chrome |
+| **Safari** | triangles: nothing to switch; `clip` + `drawImage` and the pattern tie (§4.7) | — | — |
+| **Firefox** | keep a canvas under the tessellated-output budget, or accept software on purpose: the rules of §1.11 | the accelerated backend at all (§3.2) | nothing: they are true reductions of work |
+| **Firefox** | many small separate fills: let the canvas demote rather than fight it | 3.3–4.4× on a real GPU (§6.17) | n/a, Firefox-only behaviour |
+| **Firefox** | opaque sources (JPEG, or an `alpha: false` canvas) | 1.5–1.6× on the software path (§4.13) | nothing: rule 1.12.2 already gives this |
+| **Chromium** | none beyond the all-rounder: `closePath()` omission and all-the-way batching (§0 rules 4–5) are already in it, and cost nothing elsewhere | — | — |
+
+Two things this table does not do. It never tells you to drop an all-rounder
+rule for a per-engine one: every override above replaces one choice *inside*
+a rule and keeps the rest. And it covers the engines measured here, Blink
+(Ganesh on M1, Graphite on M6), Gecko and WebKit on one machine each. Any
+override comes from fewer runs than the rule it replaces, and §10.5 says how
+many.
 
 ---
 
@@ -2024,12 +2120,13 @@ to do.
 
 ---
 
-### 3.4 WebKit / Safari — read from the source, measured by nobody here
+### 3.4 WebKit / Safari — read from the source, measured on one machine
 
-**Nothing in this section is measured.** Apple hardware has since arrived — M6
-measured Safari 26.6.2 for the path-shape results of §3.5 and §4.12 (T72) —
-but not for either mechanism below. What follows is what WebKit's source
-*says*, offered
+**The mechanisms below are read from the source, and one consequence is now
+measured.** M6 measured Safari 26.6.2 for the path-shape results of §3.5 and
+§4.12 (T72), and for patterns, sprites and tiled textures in §4.13 and §4.14
+(T75–T79). Those runs confirm the first mechanism's consequence. The
+mechanisms themselves are still what WebKit's source *says*, offered
 because two of the guide's recommendations are load-bearing enough that
 "unknown on Safari" is a worse answer than "here is the mechanism, go and
 measure it".
@@ -2041,7 +2138,10 @@ likely, and here is what to try first if you meet one.
 
 This is the one that matters, because §4.7 tells you to replace `clip` +
 `drawImage` with a pattern fill and measures that as 4–8× cheaper — on Blink
-and Gecko.
+and Gecko. **Its consequence is now measured** (§4.13, M6's Safari, one run).
+On textured triangles the two recipes tie, so the pattern loses its advantage
+without inverting. On sprites, where `drawImage` needs no clip, a pattern
+`fillRect` costs at least 16× a `drawImage`.
 
 In WebKit's CoreGraphics backend, filling a path with a pattern goes:
 
@@ -2896,18 +2996,31 @@ The deeper reason to prefer it: a pattern fill is an ordinary `fill()`. Every
 rule from the flat-colour case — one path with many subpaths, edge
 cancellation, no `closePath()`, nonzero winding — applies unchanged.
 
-**The one engine this may invert on is WebKit, and §3.4 says why.** In the CG
-backend every pattern fill calls `applyFillPattern()`, which builds a *fresh*
+**For a sprite, the ranking inverts.** A screen-aligned atlas rect has no
+clip for the pattern to remove, and `drawImage` with a source rect wins on
+every engine that separates the two: 1.46–2.25× on Chromium's CPU path,
+5.9–6.9× on Chrome's GPU canvas, 108–169× on Safari (§4.13). §4.13 also
+covers what the image source (`<img>`, `ImageBitmap`, canvas) costs, which
+this section does not vary: every texture here is a canvas built in code. That
+is the favourable case, because on Chrome's GPU canvas a 512² pattern made
+from an `<img>` or `ImageBitmap` ran at CPU raster cost. Keep pattern sources
+as canvases. And every texture here is one image that never repeats. A 3D
+engine's tiled materials are §4.14. There the `'repeat'` pattern ties on
+Chrome with a pre-tiled clip, and loses by 1.1–1.4× on Safari.
+
+**On WebKit the recipe does not win, and §3.4 says why.** In the CG backend
+every pattern fill calls `applyFillPattern()`, which builds a *fresh*
 `CGPattern` and a pattern colour space per fill — nothing is cached between
-fills — while `drawImage` is a bare `CGContextDrawImage`. That is unmeasured
-here and it is the shape of the field reports about Safari and patterns. Two
-things follow, and both are cheap insurance: **merge coplanar faces** (below),
-since the merge reduces exactly the quantity that cost is proportional to, and
-**keep the `clip` + `drawImage` recipe alive behind a runtime switch** chosen by
-timing both paths on a few real frames at startup — §1.7's argument, applied to
-the one place in this guide where an engine might genuinely want the other
-answer. Do not branch on the user-agent string; branch on the measurement, so
-the code stays right when WebKit starts caching its patterns.
+fills — while `drawImage` is a bare `CGContextDrawImage`. Measured on the same
+atlas over 1 152 triangles (§4.13, one run on M6's Safari 26.6.2), the two
+recipes **tie**: `clip` + `drawImage` 93.2–98.0 ms, pattern 100.6–101.0 ms.
+So the recipe buys nothing on Safari and costs nothing there either, and the
+runtime switch this paragraph used to recommend has, on this fixture,
+nothing to switch between. **Merging coplanar faces** (below) is still the
+thing to do, since it reduces exactly the number of pattern fills that cost
+is proportional to. A switch chosen by timing both paths at startup, as in
+§1.7, remains the safe design if your content differs from S20. Do not branch
+on the user-agent string.
 
 #### The constraint: `setTransform` is affine, a plane is not
 
@@ -5655,6 +5768,397 @@ noise, and it goes both ways.
   moves 0–0.5 %. There is nothing there to remove. (Its A3 row is slower for
   an unrelated reason: the bench variant runs the batcher twice.)
 
+### 4.13 Sprites and image sources
+
+*Registry: T75, T76, T77 — fixture and extrapolation scope in §10.5.*
+
+§4.7 left two questions open. It prices `clip` + `drawImage` against a pattern
+fill for a textured *triangle*. A sprite is a different case: a rectangle cut
+out of an atlas, where `drawImage` needs no clip at all. And every texture
+elsewhere in this guide is a canvas built in code. None of them came from a
+PNG or a JPEG, so none of the numbers says what the source type costs.
+`bench/imagepage.html` answers both on the same 512×512 atlas (S19, S20) and a
+fresh 2048×2048 image (S21), on two machines:
+
+- **M4, no GPU.** Chromium 141 on Skia's CPU rasteriser (`--disable-gpu`) and
+  Firefox 156 software. This is the path a demoted Firefox canvas runs (§3.2).
+- **M6, a real GPU.** Chrome 153 on **Skia Graphite** over Metal, Firefox
+  156.0.1 under its default accelerated profile, and Safari 26.6.2. The M6
+  numbers below are a second round, two runs per engine, on a page that
+  calibrates its repetitions on the frame interval. The first round, four runs
+  on Chrome and Firefox and one on Safari, left many GPU rows at the 100 Hz
+  refresh floor. Where both rounds exist, T75 records what the first one got
+  wrong.
+
+**Scope: this is 2D sprite and single-texture data.** Both workloads sample one
+512×512 atlas that never repeats. The 3D engine's case, small per-material
+textures tiled across each face, is §4.14, and **its rankings differ**. Read
+§4.14 before texturing a 3D engine from this section.
+
+**Every M6 Firefox A2 here is a mixed-regime figure.** With the acceleration
+indicator working, every accelerated-profile case reads accelerated after its
+first frame and after A1, and software by the end of A2. A control with the
+workload replaced by nothing demotes the same way (§4.14). So these rows start
+accelerated and finish in software, and are labelled that way.
+
+![Sprite and triangle recipes per image source on CPU and GPU, and the first draw of a fresh image per preparation](assets/image-sources.svg)
+
+*Generated by `bench/imagefigs.mjs` from `bench/out/*-img-m4.json` and M6's calibrated `*-img2-gpu-r*.json` (T75–T77).*
+
+#### The answer first
+
+| question | answer | CPU (M4) | GPU (M6) |
+|---|---|---|---|
+| sprite: `drawImage` or pattern `fillRect`? | **`drawImage`**, with a source rect | Chromium 1.46–2.25×, Firefox a tie | Chrome **5.9–6.9×**, **53–73×** rotated; Safari **108–169×**, 84–292× rotated; Firefox (mixed) a tie |
+| triangle: `clip` + `drawImage` or pattern? | **pattern**, as §4.7 says, except on Safari | 1.24–1.34× Chromium, 1.59–1.80× Firefox | 1.03–1.42× Chrome, 26.7–33.2× Firefox (mixed); **a tie on Safari** |
+| which source, steady state? | **a canvas for patterns**; for `drawImage` it depends on engine and draw | `<img>` 1.6× dearer on Chromium; opacity 1.5–1.6× on Firefox | Chrome: a 512² pattern from an `<img>` or bitmap **runs at CPU raster cost**, 4.4–67× a canvas's; Safari: the `<img>` is the cheapest `drawImage` source |
+| first draw of a fresh image? | **`await createImageBitmap(blob)`** | 3–5 ms instead of 62–137 ms | 2–8 ms instead of 17–42 ms |
+| does `img.decode()` do the same? | **not on Chromium**, CPU or GPU | Chromium 115 ms after it | Chrome 28.4–29.0 ms after it |
+| is a large `<img>` fast once decoded? | **not on Chrome's GPU canvas** | yes (3.7 ms) | **25.3–25.8 ms every draw**, against 1.8–1.9 for a bitmap |
+
+#### Sprites: `drawImage` wins everywhere it can be told apart
+
+2 000 sprites of 64×64 from an 8×8-cell atlas. The two recipes are
+`drawImage(src, sx,sy,64,64, dx,dy,64,64)` against §4.7's pattern recipe applied
+to a rect: `setTransform(1,0,0,1, dx−sx, dy−sy); fillRect(sx,sy,64,64)` with one
+`CanvasPattern` of the atlas. A2 sustained, ms per frame of 2 000 sprites.
+Sources are listed as img-png / img-jpg / bitmap / canvas. M6 cells are
+ranges over two runs.
+
+| recipe | Chromium CPU (M4) | Firefox software (M4) | Chrome Graphite (M6) | Safari (M6) |
+|---|---|---|---|---|
+| `drawImage`, 1:1 | 22.6 / 21.9 / **14.1** / **14.1** | 18.0 / 12.0 / 17.7 / **11.1** | 1.75–1.76 / 1.72–1.74 / 1.75–1.83 / 1.57–1.79 | **1.04–1.07** / 1.14–1.22 / 1.43–1.48 / 1.47–1.52 |
+| pattern `fillRect`, 1:1 | 33.0 / 34.4 / 29.6 / 31.7 | 18.0 / 11.2 / 17.0 / **10.7** | 11.9 / 11.7–11.9 / 10.9 / 2.26–2.45 | 166.8–175.7 / 162.9–168.0 / 164.3–167.5 / 164.6–167.6 |
+| `drawImage`, rotated 1.5× | 227.1 / 231.2 / **196.0** / **196.9** | 190.1 / 181.1 / 187.9 / 191.7 | 2.34–2.37 / 2.56–3.04 / 2.48–2.89 / 2.20–2.61 | **1.23–2.01** / 2.08–2.35 / 2.20–2.73 / 2.32–2.88 |
+| pattern, rotated 1.5× | 293.0 / 299.4 / 289.8 / 310.5 | 196.2 / 171.0 / 185.8 / 168.1 | 161.6–170.5 / 161.3–171.3 / 159.5–170.4 / 2.57–3.94 | 328.0–358.7 / 315.1–340.1 / 240.4–256.1 / 240.5–254.6 |
+
+**`drawImage` is cheaper on every engine that separates the two, and on the
+GPU the gap grows by an order of magnitude.** On Chrome's Graphite canvas, a
+pattern sprite from an `<img>` or a bitmap costs **5.9–6.9×** a `drawImage`
+sprite unscaled and **53–73×** rotated. From a canvas the pattern costs only
+1.27–1.56× unscaled and 0.98–1.80× rotated, because only a canvas-sourced
+pattern stays on the GPU (source type, below). On Safari the pattern costs
+**108–169×** unscaled and **84–292×** rotated. That is the CoreGraphics
+mechanism §3.4 read from the source, now measured. Firefox ties in software
+(within 7 % unscaled, 13 % rotated) and under the accelerated profile
+(0.82–1.54× unscaled and 0.84–1.18× rotated, mixed regime).
+
+The mechanism is the clip. §4.7's pattern recipe wins for triangles because it
+removes a `clip` + `save`/`restore` per triangle. A sprite has no clip to
+remove, so the pattern only adds a `setTransform` per sprite and a shader that
+samples through a matrix.
+
+**This is a negative result for the SwiftShader instrument.** M4's
+SwiftShader Chromium, Ganesh on an emulated GPU, ranked pattern sprites 3–5×
+*ahead*. On a real GPU they are 5.9× and more *behind*. The ranking it gave was
+wrong, not just imprecise, which is what §10.1 warns about its timings.
+
+#### Triangles: §4.7 holds on Chrome and Firefox, and ties on Safari
+
+The same atlas mapped over 1 152 triangles (S20), A2, ms per frame:
+
+| recipe | Chromium CPU (M4) | Firefox software (M4) | Chrome Graphite (M6) | Firefox, accelerated profile, mixed (M6) | Safari (M6) |
+|---|--:|--:|--:|--:|--:|
+| `clip` + `drawImage` | 33.7–34.9 | 31.1–32.0 | 2.05–2.87 | 69.6–88.6 | 95.1–100.4 |
+| pattern fill | 25.1–27.7 | 17.7–19.6 | 1.53–2.79 | 2.57–2.76 | 101.3–103.3 |
+
+- **Chrome:** the pattern wins by 1.03–1.42× per run. That is narrower than
+  it looks: the two runs spread by up to 57 %, and one run's `<img>` and
+  bitmap pairs are inside the 10 % noise. From a canvas it is 1.28–1.42×.
+- **Firefox, accelerated profile:** the pattern is **26.7–33.2×** cheaper. That
+  is the clip-path cost §3.2 records for 1 152 novel clip paths per frame
+  thrashing the path cache, measured in a loop that ends in software.
+- **Safari:** the two recipes **tie**, clip ÷ pattern 0.92–0.99. §4.7's recipe
+  buys nothing on Safari, and costs nothing either. §3.4's worry that Safari
+  might *invert* it is answered on this fixture: a tie, from three runs over
+  two rounds.
+
+#### Bleed: a transformed sprite leaves its cell on most samplers
+
+Part X measures bleed directly. It renders the same sprites from two copies of
+the atlas that are identical inside the cells, one with black gutters and one
+with white. Any pixel that differs between the two renders was sampled outside
+the sprite's cell. Pixels that differ, of 921 600:
+
+| sampler | either recipe, 1:1 | `drawImage`, rotated 1.5× | pattern, rotated 1.5× |
+|---|--:|--:|--:|
+| Chromium, Skia CPU (M4, M6) | 0 | **43 728–46 820** | **46 830** |
+| Chrome, Graphite GPU (M6, displayed canvas) | 0 | **43 728** | **43 767–46 830** |
+| Chromium, Ganesh on SwiftShader (M4, displayed canvas) | 0 | **48 397** | **46 830–48 413** |
+| Firefox, Skia CPU (M4, M6) | 0 | 0 | 0, or **45 063–46 833** from a canvas source |
+| Firefox, WebGL backend (M6 GPU; M4 llvmpipe) | 0 | **43 766**; 43 785 | **43 763**; 43 787 |
+| Safari, `willReadFrequently` canvas (M6) | 0 | **0** | **43 633–43 634** |
+| Safari, displayed canvas (M6) | 0 | **0** | **45 158–45 159** |
+
+About 36 000–38 000 of those pixels differ by more than 16 levels. **Only
+Safari's `drawImage`, on either canvas, and Firefox's CPU path (except for a
+pattern made from a canvas), keep a transformed sprite inside its source
+rect.** Every other sampler bleeds with either recipe, and Firefox's GPU
+canvas bleeds where its CPU path does not. The source rect does not stop a
+bilinear filter from reading the neighbouring cell. So the reason people
+reach for `drawImage` (it "clips to the source rect") does not hold on most
+engines, and the pattern is no worse there. **A transformed sprite needs a
+padded atlas whichever recipe draws it**, the same requirement §4.8 states for
+a textured face: extrude each cell's border texels into a gutter of at least
+1 px at the largest scale you draw. That the displayed canvas ran on the GPU
+is *inferred* on Chrome and Firefox from its different sampling, and
+unverified on Safari.
+
+#### The source type, in the steady state
+
+The four sources hold the same pixels. On every engine, PNG-derived `<img>`,
+`ImageBitmap` and canvas read back **bit-identical**, so every timing gap
+below is a path gap, not a content gap.
+
+**For a pattern, a canvas is the source that is never slower.** For
+`drawImage` there is no single answer: it depends on the engine and on whether
+the draw is a sub-rect or a whole scaled image.
+
+- **Chromium CPU (M4): the `<img>` is the slow source.** An unscaled
+  `drawImage` sprite costs 22.6 ms from an `<img>` and 14.1 ms from a bitmap or
+  a canvas, 1.60×.
+- **Chrome GPU (M6): not for sub-rect sprites.** A sub-rect `drawImage` from an
+  `<img>` (1.75–1.76 ms) ties with a bitmap (1.75–1.83) and a canvas
+  (1.57–1.79). **But a whole-image scaled draw is 2.8–4.1× dearer from an
+  `<img>` at every size from 256 to 4096 px** (§4.14), and a 2048² `<img>` is
+  13–14× its bitmap even at 1:1 (first use, below).
+- **Chrome GPU: a 512² pattern needs a canvas source.** A pattern made from an
+  `<img>` or an `ImageBitmap` costs what the CPU raster costs: A2 ÷ A3 is
+  1.00–1.04, at 10.9–11.9 ms unscaled and 159.5–171.3 ms rotated. The same
+  pattern made from a canvas costs 2.26–2.45 and 2.57–3.94 ms, **4.4–5.3×**
+  and **at least 40×** cheaper. *Mechanism unmeasured.* A2 = A3 fits a
+  pattern image that is not resident on the GPU, sampled on the CPU. **Small
+  tiled patterns do not show it** (§4.14: A2 is 12–20 % of A3 from the same
+  kinds of source), and neither does the triangle pattern. So it is not every
+  pattern, and what separates them (size, `'repeat'`, `fill()` against
+  `fillRect()`) is unmeasured. A canvas source avoids it in every case.
+- **Safari (M6): the `<img>` is the cheapest `drawImage` source.** 1.04–1.07 ms
+  unscaled, against 1.43–1.52 for a bitmap or a canvas, so the canvas costs
+  **1.37–1.46×** more there. For patterns the order reverses: the rotated
+  pattern favours a bitmap or canvas (240.4–256.1 ms) over an `<img>`
+  (315.1–358.7) by 1.23–1.49×.
+- **Firefox software (M4 and M6): opacity matters.** An unscaled sprite costs
+  11.1 ms from an `alpha: false` canvas and 12.0 ms from a JPEG `<img>`,
+  against 17.7–18.0 ms from a PNG `<img>` or a bitmap made from it: 1.5–1.6×
+  on M4, and 1.52–1.64× on M6. *Mechanism inferred, not measured.* A JPEG and
+  an `alpha: false` canvas have no alpha channel, so Firefox can copy them
+  instead of blending. Rotated, the gap shrinks to 1.08×.
+- **Firefox, accelerated profile (M6, mixed regime): no source ranking.**
+
+#### First use, and a large `<img>` that never gets fast
+
+A steady-state loop never sees decoding: the warm-up frames pay for it. A game
+pays for it on the frame a new sprite sheet first appears. A10 (§8.1) prices
+that frame. Each trial uses a fresh 2048×2048 source (S21), a fresh target,
+one draw scaled to 1280×720, and a 1 px read to force completion. Median of
+7 trials, ms, first draw / second draw. M6 cells are ranges over r1–r4.
+
+| preparation | Chromium CPU (M4) | Firefox sw (M4) | Chrome GPU (M6) | Firefox accel. (M6) | Safari (M6) |
+|---|--:|--:|--:|--:|--:|
+| `<img>` PNG, `onload` only | **113.5** / 3.7 | **62** / 4 | **28.5–28.8 / 25.3–25.6** | **33–42** / 1–5 | **29** / 1 |
+| `<img>` PNG, `await img.decode()` | **114.7** / 3.7 | 4 / 3 | **28.4–29.0 / 25.4–25.8** | 4–8 / 2–5 | 3 / 1 |
+| `<img>` JPEG, `onload` only | **107.0** / 4.0 | **136** / 3 | **16.6–17.0 / 17.7–18.6** | **31–38** / 2–5 | **22** / 1 |
+| `<img>` JPEG, `await img.decode()` | 38.7 / 3.7 | 4 / 3 | **16.9–17.3 / 17.8–18.4** | 4–8 / 1–4 | 3 / 1 |
+| `await createImageBitmap(pngBlob)` | **3.4** / 3.1 | **5** / 4 | **3.5–4.3** / 1.8–1.9 | **4–8** / 1–4 | 7 / 1 |
+| `await createImageBitmap(jpgBlob)` | **3.4** / 3.1 | **3** / 3 | **3.0–3.7** / 1.8 | **4–8** / 1–5 | **2** / 1 |
+| canvas, `<img>` drawn in at load (+ main-thread block) | 3.3 / 3.1 (+ 75.9) | 4 / 3 (+ 74) | 1.4–1.7 / 2.4–2.6 (+ 27.5–27.8) | 2–4 / 2–3 (+ 33–50) | 1 / 1 (+ 32) |
+
+- **A plain `<img>` decodes inside its first draw on every engine**: 16.6–137 ms
+  of main thread on the frame that uses it.
+- **`createImageBitmap` is the one preparation that fixes it everywhere.** The
+  first draw costs 2–8 ms on every engine. The decode still takes 16–147 ms of
+  wall time, but inside a promise, not inside your frame.
+- **`img.decode()` fixes it on Firefox and Safari and not on Chromium**, on the
+  CPU or on the GPU. A PNG costs the same after `decode()` as without it
+  (114.7 against 113.5 ms on M4, 28.4–29.0 against 28.5–28.8 on M6).
+  *Mechanism unmeasured.* The decode it triggers is evidently not the one the
+  draw looks up.
+- **On Chrome's GPU canvas, a 2048² `<img>` is slow on every draw, not just the
+  first.** The second draw costs 25.3–25.8 ms (PNG) and 17.7–18.6 ms (JPEG),
+  against 1.8–1.9 ms from a bitmap: **13–14×**. The 512² atlas in the
+  steady-state loop does not pay it, so what triggers it is unmeasured. Size,
+  or a draw count before the image becomes resident, would both fit. Either
+  way a large `<img>` drawn every frame on Chrome is a recurring cost that no
+  warm-up hides.
+- **A canvas copy moves the stall to load time rather than removing it.**
+  27.5–75.9 ms of synchronous main thread at creation, depending on the engine.
+  That is fine behind a loading screen and wrong mid-game. To end up with a
+  canvas without the stall, draw an `ImageBitmap` into it: that copy starts
+  from pixels that are already decoded.
+
+#### What is left unmeasured
+
+- **A steady accelerated Firefox number.** Every M6 Firefox A2 demotes during
+  its loop (§4.14), so none is a clean accelerated cost.
+- **Why** Chrome runs a 512² pattern from an `<img>` at CPU cost and a 128²
+  tiled one on the GPU, and why its `<img>` costs 2.8–4.1× a bitmap for a
+  scaled whole-image draw but not for a sub-rect one.
+- **Ganesh on a real GPU** (M1). Every Chrome GPU number here is Graphite.
+  §10.1 warns against carrying a ratio between the two.
+
+The rules, then:
+
+1. **Never let an `<img>` be drawn for the first time inside a frame.**
+   `await createImageBitmap(blob)` at load. `img.decode()` is not a
+   substitute on Chromium.
+2. **Sprites: `drawImage` with a source rect**, on every engine. Pad the atlas
+   if the sprites rotate or scale.
+3. **Patterns: always from a canvas.** Draw each `ImageBitmap` once into a
+   canvas (`alpha: false` if the art is opaque). On Chrome's GPU canvas that
+   is the difference between a pattern on the GPU and one at CPU raster cost.
+4. **`drawImage`: never a whole `<img>` scaled on Chrome.** Draw its bitmap or
+   a canvas (2.8–4.1×, and 13–14× for a 2048² image). Safari's sprites are
+   the one case where the `<img>` is cheapest, by 1.37–1.46×.
+5. **Triangles: §4.7's pattern recipe**, with a canvas source. On Safari it
+   ties with `clip` + `drawImage`, so there is nothing to switch for.
+6. **Textured 3D faces: §4.14.**
+
+### 4.14 Textured 3D faces: tiled materials
+
+*Registry: T78, T79 — fixture and extrapolation scope in §10.5.*
+
+§4.13 measured sprites and one atlas that never repeats. A canvas2d 3D engine
+textures its faces differently: small per-material textures that **tile**
+across each face. That gives three ways to draw a face:
+
+- a **`'repeat'` pattern** with the face's UV → screen map on the context (§4.7's
+  recipe);
+- **`clip` + a pre-tiled canvas**, where the material was tiled into a canvas at
+  load, then drawn through the same map;
+- **`clip` + one `drawImage` per repetition**.
+
+`imagepage.html`'s part M prices all three on S22: a perspective floor and two
+walls, 336 quads with a mean of 4 475 px² each, covering 74.7 % of the canvas.
+There are eight 128×128 materials, each tiled 4 × 4 per face (and once more
+at 1 × 1), and three sources per material: a PNG `<img>`, an `ImageBitmap`,
+and a small 128×128 canvas. Part B sweeps image size for the per-draw cost of
+each source (S23). Machine M6: three runs of part M, two of part B, and one of
+each control. The picture check first confirms the three recipes draw the same
+scene, up to edge antialiasing and tile seams: RMSE 2.4 / 7.6 on Chrome, 4.5 /
+8.9 on Firefox, but **11.3 / 17.4 on Safari**. Safari's recipes therefore
+differ in picture as well as in cost.
+
+![Tiled-material recipes and sources per engine on M6, and the per-draw cost of each image source against size](assets/texture-materials.svg)
+
+*Generated by `bench/imagefigs.mjs` from `bench/out/*-imgM-gpu-r*.json`, `*-imgM1-gpu-r1.json` and `*-imgB-gpu-r*.json` (T78, T79).*
+
+#### The answer first
+
+| question | Chrome (Graphite) | Firefox | Safari |
+|---|---|---|---|
+| which recipe for a tiled face? | pattern **ties** with pre-tiled | pattern, **≥ 39×** (mixed regime, below); 1.39–1.60× in software | **pre-tiled**, 1.11–1.40× ahead of the pattern |
+| `drawImage` per tile? | **7.8–11.4×** the others | 1.2–2.0× the pattern in software | **13.5–17.0×** |
+| which source for a pattern? | `<img>` or canvas; a bitmap is 1.36–1.47× dearer | no difference | canvas or bitmap; `<img>` 1.07–1.15× dearer |
+| whole-image `drawImage`: `<img>` against its bitmap? | **2.8–4.1× dearer from 256 px up** | ≤ 1.25× | ≤ 1.23×, and cheaper at 2048 |
+
+**The portable choice for a 3D engine is the `'repeat'` pattern, from a
+canvas.** It is never worse than 1.4× the best recipe on any engine, it is at
+least 39× ahead on Firefox's accelerated profile, and it keeps texturing an
+ordinary `fill()` so every batching rule applies (§4.7). **Never draw tiles
+one `drawImage` at a time.**
+
+#### The recipe, per engine
+
+A2, ms per frame of the S22 scene. Chrome and Safari cells are ranges over
+three runs; the sources are listed as img-png / bitmap / canvas.
+
+| recipe | Chrome, tiled 4×4 | Chrome, 1×1 | Safari, tiled 4×4 | Safari, 1×1 | Firefox software, 4×4 |
+|---|---|---|---|---|---|
+| `'repeat'` pattern | **0.43–0.46** / 0.63–0.64 / 0.50–0.53 | 0.42 / 0.62 / 0.45 | 34.0–34.8 / 30.1–31.8 / 30.3–31.9 | 48.5 / 43.9 / 33.2 | **3.09 / 2.93 / 2.78** |
+| `clip` + pre-tiled canvas | **0.44–0.46** / 0.45–0.50 / 0.45–0.54 | 0.44 / 0.47 / 0.49 | **24.9–27.4 / 24.8–27.1 / 24.8–27.2** | **26.9 / 26.9 / 27.0** | 4.30 / 4.19 / 4.44 |
+| `clip` + `drawImage` per tile | 4.52–4.61 / 5.00–5.05 / 4.47–5.15 | 0.50 / 0.51 / 0.50 | 386.1–422.1 / 374.2–399.2 / 367.2–397.2 | 29.1 / 28.8 / 29.0 | 12.3 / 17.0 / 13.9 |
+
+- **Chrome: the pattern and the pre-tiled canvas tie.** From an `<img>`,
+  0.43–0.46 against 0.44–0.46 ms. `drawImage` per tile costs 7.8–11.4× them at
+  4 × 4, and nothing extra at 1 × 1, where it *is* one `drawImage`.
+- **Safari: the pre-tiled canvas wins.** The pattern is 1.11–1.40× dearer at
+  4 × 4 and 1.23–1.80× at 1 × 1. Per tile it is 13.5–17.0×. This agrees with
+  §3.4's source reading, where every pattern fill builds a new `CGPattern`,
+  and with §4.13's sprites, where Safari's pattern loses by two orders of
+  magnitude. It also agrees with §4.7's triangles, which tie on Safari.
+- **Firefox: the pattern wins everywhere.** On the accelerated profile it
+  costs 0.39–0.50 ms against 19.8–24.5 for either clip recipe, at least
+  **39×**, and 47.6–51.4× at 1 × 1. That is the clip-path cost §3.2 records.
+  In software the margin is 1.39–1.60× over pre-tiled and 3.98–5.82× over per
+  tile. **Every accelerated-profile row here demoted during its timing loop**
+  (below), so those numbers mix both regimes. The ranking is the same in
+  either.
+
+#### The source, for materials
+
+**No source is far behind for a tiled pattern on any engine.** That separates
+this case from §4.13's large no-repeat sprite pattern, where Chrome ran
+patterns from an `<img>` or bitmap at CPU raster cost (A2 ÷ A3 = 1.00–1.04).
+Here, from the same kinds of source, A2 is 12–20 % of A3. *Mechanism
+unmeasured.* Size, `'repeat'`, or `fill()` against `fillRect()` could each
+separate the two, and none was varied alone.
+
+- **Chrome:** the `<img>` pattern is cheapest (0.43–0.46 ms). The canvas is
+  1.09–1.23× that, and the **bitmap is the dearest, 1.36–1.47×**.
+- **Safari:** the `<img>` pattern costs 1.07–1.15× the small canvas at 4 × 4,
+  and 1.46× at 1 × 1 (one run). A bitmap is level with the canvas at 4 × 4.
+  So a small pre-rendered canvas is never slower on Safari, but the gap is
+  1.07–1.46×, not an order of magnitude. Whether Safari re-decodes the PNG is
+  **not measured**: no row times a decode.
+- **Firefox:** the sources are within a few per cent of each other on either
+  profile.
+
+A canvas is therefore the safe pattern source: within 1.23× of the best on
+every engine, and never the dearest.
+
+#### Whole-image draws: Chrome's `<img>` costs 2.8–4.1× its bitmap at every size
+
+Part B draws one image 16 times per frame, scaled into 320×180 cells, for
+sizes 256–4096 px. A2 per 16 draws, ms, ranges over two runs; **F** marks a
+row on the refresh floor, so an upper bound:
+
+| size | Chrome `<img>` / bitmap / canvas | Safari `<img>` / bitmap / canvas | Firefox software `<img>` / bitmap / canvas |
+|--:|---|---|---|
+| 256 | **0.07–0.08** / 0.02–0.03 / 0.02 | 0.04–0.06 / 0.05 / 0.04–0.59 F | 2.35 / 1.93 / 1.70 |
+| 512 | **0.07–0.08** / 0.03–0.50 F / 0.01–0.02 | 0.05–0.06 / 0.05–0.06 / 1.00 F | 1.49 / 1.49 / 1.34 |
+| 1024 | **0.12–0.13** / F / 0.01–0.02 | 0.05–0.10 / 0.07–0.08 / 2.50 F | 1.60 / 1.60 / 1.39 |
+| 2048 | **0.37–0.41** / F / 0.01–0.02 | 0.09–0.10 / 0.12–0.13 / 0.14–5.00 F | 1.66 / 1.66 / 1.46 |
+| 4096 | **2.22–2.62** / 0.81–0.85 / 1.42–1.44 | 0.17–0.23 / 0.19–0.23 / 0.20–0.23 | 1.83 / 1.90 / 2.68 |
+
+- **On Chrome an `<img>` costs 2.8–4.1× its bitmap from 256 px up**, wherever
+  the bitmap row is resolved, and 3.7–33.6× a canvas up to 2048. §4.13's
+  2048² first-use table saw the same thing as a slow second draw. The 512²
+  sprite atlas does *not* pay it for 1:1 sub-rect draws (1.75–1.76 ms against
+  a bitmap's 1.75–1.83), so it applies to scaled whole-image draws. *Mechanism
+  unmeasured.*
+- **Safari and Firefox:** `<img>` ÷ bitmap stays at 0.75–1.25 at every size.
+- At 4096 on Chrome the canvas (1.42–1.44) costs more than the bitmap
+  (0.81–0.85).
+- 11 rows stayed on the refresh floor despite the calibration, all of them
+  cheap draws in part B. Chrome's `<img>` against bitmap at 1024 and 2048 is
+  therefore unresolved, and bounded only by the canvas.
+
+#### On Firefox, the timing loop itself demotes the canvas
+
+With the acceleration indicator fixed, every accelerated-profile Firefox row
+on M6 reads `ACCEL > ACCEL > soft`: accelerated after its first presented
+frame, still accelerated after A1, and on software by the end of A2. That is
+all 114 rows, and the 9 rows of a control with **the workload replaced by
+nothing** (only the loop's clears). It matches M4's llvmpipe runs (§4.13).
+Part F's targets, which never run a sustained loop, stay accelerated. So a
+Firefox A2 on this page is a **mixed-regime** figure: part of it accelerated,
+the rest software. What in the loop fails the usage profile (§3.2) is
+**unmeasured**. The control ran 4 096 clears per frame, and the real cases 4
+to 250. §8.1 carries the consequence for every Firefox A2.
+
+#### Rules
+
+1. **Texture 3D faces with a `'repeat'` pattern whose source is a canvas.** It
+   ties on Chrome and wins by ≥ 39× on accelerated Firefox and 1.4–1.6× in
+   software. On Safari it costs 1.11–1.40× a pre-tiled clip.
+2. **On Safari only, `clip` + a pre-tiled canvas is 1.11–1.80× cheaper** than
+   the pattern. Keep it behind the §1.7-style runtime switch if Safari
+   matters, and pick by timing both at startup.
+3. **Never `drawImage` once per tile**: 7.8–17.0× at 4 × 4.
+4. **On Chrome, never draw a whole `<img>` scaled every frame.** Draw its
+   bitmap or a canvas: 2.8–4.1× at every size measured.
+
+
 ---
 
 ## 5. Measurements
@@ -6857,6 +7361,38 @@ its square while running at exactly the software profile's cost, through a
 route in `DrawTargetWebgl::DrawPath` that draws with Skia without failing the
 usage profile (T70 — observed, cause not established).
 
+### 6.18 A raw `<img>` decodes inside the first frame that draws it
+
+*Registry: T77 — fixture and extrapolation scope in §10.5.*
+
+`onload` means the bytes arrived, not that the pixels exist. The first
+`drawImage` of a fresh 2048×2048 `<img>` took **16.6–137 ms** of main thread
+inside the draw call, on every engine measured, CPU and GPU. The obvious fix,
+`await img.decode()`, works on Firefox and Safari (a first draw of 1–8 ms).
+On Chromium it does **nothing for a PNG**: 114.7 ms after `decode()` against
+113.5 ms without on the CPU, and 28.4–29.0 against 28.5–28.8 on Chrome's GPU
+canvas. `await createImageBitmap(blob)` gives a first draw of 2–8 ms on every
+engine, because the decode happens in the promise.
+
+**And on Chrome's GPU canvas the second draw is no better.** A 2048² `<img>`
+costs 25.3–25.8 ms on *every* later draw, against 1.8–1.9 ms from the bitmap
+of the same image: 13–14× on every frame. Warming up does not hide it.
+Draw large images from a bitmap or a canvas (§4.13).
+
+### 6.19 Two texture recipes that look harmless and cost 8–170×
+
+*Registry: T75, T78 — fixture and extrapolation scope in §10.5.*
+
+- **A pattern `fillRect` per sprite.** It reads like §4.7's fast recipe, but a
+  sprite has no clip for it to remove. On M6 it costs **108–169×** a
+  `drawImage` sprite on Safari and **5.9–6.9×** on Chrome, where it is 53–73×
+  rotated (§4.13).
+- **One `drawImage` per tile of a repeating material.** It is the obvious way
+  to tile without a pattern, and it costs **7.8–11.4×** on Chrome and
+  **13.5–17.0×** on Safari at 4 × 4 tiles per face (§4.14). A `'repeat'`
+  pattern, or one `drawImage` of a canvas pre-tiled at load, draws the same
+  face.
+
 ## 7. Checklist
 
 Setup, once:
@@ -6875,6 +7411,16 @@ Setup, once:
       makes it much more so (§4.9, §4.11).
 - [ ] One `ClassPrep` per pass that has a coarse colour key, tile 16 px, and a
       survivor `Int32Array` per pass (§4.11).
+- [ ] **Per-browser overrides, only after everything above holds** (§1.13):
+      each one chosen by timing both paths on real frames at startup, never
+      by user-agent.
+- [ ] Every image `await createImageBitmap(blob)`-ed before its first frame,
+      then drawn once into a canvas (`alpha: false` if opaque), and that
+      canvas used as every `createPattern` source. Never a raw `<img>` drawn
+      whole in the frame loop. Sprites drawn with `drawImage`, not a pattern.
+      Tiled materials drawn with a `'repeat'` pattern, never one `drawImage`
+      per tile. Atlases for rotated or scaled sprites padded with extruded
+      gutters (§4.13, §4.14, §6.18).
 
 Every frame:
 
@@ -7123,6 +7669,21 @@ callback, at 1.4–3.0× per draw once N ≥ 8 — so the repeat measures the
 clears. Open the repeated draw with the same fill at alpha 0.996 (identical
 to within 1/255), or clear once per callback; Firefox is indifferent.
 
+And size N on the frame interval itself, not on a CPU estimate. A CPU raster
+time overstates a GPU's cost 10–100×, so an N guessed from it puts one draw
+into a 10 ms frame, and the row then reads the display's refresh rate. M6's
+first `imagepage.html` run lost its fastest rows that way (T75). Double N until
+one callback spans ≥ 50 ms, then measure.
+
+**On Firefox, check the verdict after the loop, not before.** A loop of
+repeated draws per callback, sustained for seconds, demotes a Firefox canvas
+by itself. With the acceleration indicator read after the first frame, after
+A1 and after A2, every `imagepage.html` case on M4 and M6 went
+`ACCEL > ACCEL > soft`. So did a control that drew nothing but the loop's
+clears (T78). A Firefox A2 taken this way is mixed-regime unless the verdict
+after A2 reads accelerated. That is consistent with §10.1's standing warning
+that a Firefox number is a software number unless the entry says otherwise.
+
 Then `hidden = sustained − record` is the part `performance.now()` cannot see,
 and it is the most informative column in any table you build. `raster` is also
 your proxy for Firefox after demotion (§3.2), which is the regime a canvas2d 3D
@@ -7182,6 +7743,32 @@ verdicts on M4 and M6 once repeated shapes are counted once (T68). It
 predicts nothing for a rotating 3D frame, which demotes on the miss ratio
 whatever its size (§3.5). And it is a count, so it carries no noise and needs
 no minimum.
+
+#### And one more, for the frame that first touches a resource
+
+The three axes above all warm up first, so they cannot see anything paid once
+per resource. An image is decoded, and on a GPU uploaded, on its first use.
+A game pays for that on the frame a sprite sheet first appears (§4.13). **A10,
+first use:**
+
+```
+first_use(prepare):                 # per trial, everything fresh
+    src = await prepare()           # onload / decode() / createImageBitmap / canvas copy
+                                    #   (time any synchronous span inside it as block)
+    tgt = new displayed canvas; clear; ctx.getImageData(0, 0, 1, 1)
+    await rAF
+    t0 = now(); ctx.drawImage(src, ...); ctx.getImageData(0, 0, 1, 1)
+    first = now() - t0              # the frame that meets the source cold
+    t0 = now(); ctx.drawImage(src, ...); ctx.getImageData(0, 0, 1, 1)
+    second = now() - t0             # the control: the same draw, warm
+    return median over trials of (block, first, second)
+```
+
+The 1 px read is what makes a CPU timer legitimate here. It forces the draw to
+complete, so the decode cannot hide in deferred work. The price is that
+Firefox counts the read against the acceleration profile, which is why the
+target is fresh every trial. `first − second` is the one-off cost, and `block`
+is the part of the preparation that held the main thread.
 
 ### 8.2 Counting, with no browser at all
 
@@ -7577,6 +8164,51 @@ hundred canvases stops being given accelerated ones (§8.6).
 PAGE=bandpage.html TAGSUFFIX=-band node bench/run.js edge firefox firefox-dbg
 ```
 
+```bash
+PAGE=imagepage.html TAGSUFFIX=-img node bench/run.js edge firefox-nonaccel
+node bench/imagefigs.mjs              # regenerate assets/image-sources.svg
+```
+
+prices sprites (`drawImage` against a pattern `fillRect`) and §4.7's two
+triangle recipes on every image source — PNG and JPEG `<img>`,
+`ImageBitmap`, canvas — measures atlas bleed with the gutter test, and times
+the first use of a fresh image per preparation (§4.13). `EXTRA=parts=F` runs
+only the first-use part. The page calibrates A2's repetitions on the frame
+interval itself (§8.1), and flags any row still on the refresh floor as
+`VSYNC-FLOORED`. Its bleed part renders on both a `willReadFrequently`
+canvas and a displayed default one, and records the A7 verdict after the
+first frame, after A1 and after A2. `?sustbg=opaque`, `?noop=1` and
+`?detached=1` are the controls that placed M4's Firefox demotion (§4.13).
+Part M draws a perspective scene of textured quads, a floor and two walls with
+eight 128 px materials each tiled `?rep=` times (default 4). It prices a
+`'repeat'` pattern against `clip` + a pre-tiled canvas and `clip` + one
+`drawImage` per tile, from `<img>`, `ImageBitmap` and small-canvas sources,
+and first checks that the three recipes draw the same picture. Part B sweeps
+image size (`?sizes=`, default 256–4096) for the per-draw cost of each source.
+
+On M4 the tag suffix was `-img-m4`, with the Chromium arguments of the M4
+block below. It ran once more with
+`EDGE_ARGS="--no-sandbox --use-angle=swiftshader --enable-unsafe-swiftshader"`
+and `-img-sws-m4` for the instrument run, and again with the fixed page as
+`-imgX-sws-m4` (`EXTRA=parts=X`) and `firefox-dbg` `-img2-m4` under
+`ff-softgl.prefs`. On M6 it ran as `-img-gpu-r1` to `-r4` on `edge` and
+`firefox-dbg`, `-img-gpu-r1` on `firefox-nonaccel` and `safari`, and as
+`-imgF-gpu-r1` and `-r2` for part F alone. Those runs predate the
+repetition calibration and the indicator fix. The second M6 round used the
+fixed page:
+
+```bash
+PAGE=imagepage.html TAGSUFFIX=-imgM-gpu-r1 EXTRA="parts=M" node bench/run.js edge firefox-dbg safari   # r1-r3
+PAGE=imagepage.html TAGSUFFIX=-imgM1-gpu-r1 EXTRA="parts=M&rep=1" node bench/run.js edge firefox-dbg safari
+PAGE=imagepage.html TAGSUFFIX=-imgB-gpu-r1 EXTRA="parts=B" node bench/run.js edge firefox-dbg safari   # r1-r2
+PAGE=imagepage.html TAGSUFFIX=-img2-gpu-r1 EXTRA="parts=X,S,T,F" node bench/run.js edge firefox-dbg safari   # r1-r2
+PAGE=imagepage.html TAGSUFFIX=-imgM-gpu-r1 EXTRA="parts=M,B" node bench/run.js firefox-nonaccel
+PAGE=imagepage.html TAGSUFFIX=-imgMnoop-gpu-r1 EXTRA="parts=M&noop=1" node bench/run.js firefox-dbg
+```
+
+Runs disturbed by other load on the machine were repeated once and kept as
+`*-disturbed.json`, and no table uses them.
+
 prices the two gap repairs of §4.8 against each other on both fixtures, with
 exact gap and outline coverage and Gecko's acceleration verdict per case.
 
@@ -7933,8 +8565,9 @@ you when it does not.
 `chrome://gpu` reports as Graphite on Dawn/Metal; every other Chromium GPU
 number in this registry is Ganesh (M1). Do not carry a Chromium GPU ratio
 between the two backends without saying which one you measured. And WebKit /
-Safari — M6's Safari 26.6.2, two runs of three parts (T72); §3.4 is still
-quoted from WebKit's source, not measured.
+Safari — M6's Safari 26.6.2: two runs of three parts (T72), and two rounds of
+`imagepage.html`, eight runs in all (T75–T79). §3.4's mechanism is quoted from WebKit's source,
+and its consequence for patterns is measured in §4.13.
 
 **M4 has no GPU, and says so in every entry that uses it.** Its Skia-on-CPU
 numbers (Chromium `--disable-gpu`, Firefox software, and every A3 column) are
@@ -7998,6 +8631,11 @@ duplicated here:
 | **S16** | fragmentation sweep: S1 with the palette's shade count varied over 2 / 4 / 8 / 16 / 32 (× 8 bands), S3 over 2 / 6 / 12 / 24 / 48 (× 4 bands). Same geometry, same visible set; smaller colour regions as shades rise, measured by boundary verts ÷ 3n = 0.20 → 0.54 (S1), 0.14 → 0.73 (S3) | §4.12 |
 | **S17** | single-path tier shapes, one path drawn 200× per timing: a convex 48-gon (r 90 px), a concave 48-point star (r 50 / 99 px), a self-crossing {48/17} star polygon (r 90 px), and 16 disjoint hexagons (r 22 px) in one path | §3.5 |
 | **S18** | merge-or-split shapes of one colour, drawn 1 000× per A3 timing. Sixteen on a 4 × 4 grid: disjoint hexagons (r 22 px) close (spacing 60) and spread over the canvas (300 × 170), small triangles (r 4 px) spread the same way, touching squares (30 px, spacing 30, 0.37 px off the pixel grid so shared edges antialias) with shared edges left in and as their cancelled 120 px outline, and hexagons overlapping lightly (spacing 38) and heavily (spacing 12). And one pair: two hexagons (r 60, 72 px apart) and two 120 × 80 rectangles (offset 60, 40), each overlapping with no shared edge, the rectangles also as their precomputed union outline. Each as one path of subpaths and as one fill per shape | §1.7 |
+| **S19** | sprite atlas: 512×512, 8 × 8 cells of 64 px, each a gradient, a disc and hashed noise, fully opaque; PNG 362–388 KB, JPEG q 0.92 139 KB (Chromium's encoder) or 259 KB (Firefox's). 2 000 sprites at fixed LCG positions on 1280×720, 1:1 and rotated at 1.5×. Four sources of the same pixels: `<img>` PNG, `<img>` JPEG, `createImageBitmap(png)`, a canvas the PNG was drawn into. For the bleed test the cells are respread to a 128 px stride with black or white gutters | §4.13 |
+| **S20** | 1 152 triangles, a 24 × 24 quad grid mapping S19's atlas onto a bent 900 × 560 region, one affine map per triangle; the same four sources | §4.13 |
+| **S21** | first-use source: 2048×2048 in S19's style (256 px cells), PNG 5.4–5.8 MB, JPEG 1.9–3.6 MB, drawn scaled to 1280×720 or 1:1 from its top-left corner, fresh per trial | §4.13, §6.18 |
+| **S22** | tiled-material scene: pinhole camera over a floor (20 × 14) and two walls (14 × 5 each) of unit quads, 336 on screen after culling, mean 4 475 px², 74.7 % of 1280×720 covered, drawn back to front. Eight 128×128 materials (cells of S19's pattern), each face tiling its material `rep` × `rep` (4 or 1), one affine map per face fitted at three corners, every recipe covering that same affine outline. Sources per material: `<img>` PNG, `createImageBitmap(png)`, a 128×128 canvas | §4.14 |
+| **S23** | image-size sweep: S19's pattern at 256, 512, 1024, 2048, 4096 px, as `<img>` PNG (after `decode()`), `ImageBitmap` and canvas, drawn whole 16 times per frame into a 4 × 4 grid of 320×180 cells | §4.14 |
 
 ### 10.3 Fixture: the configurations
 
@@ -8028,6 +8666,7 @@ Defined in §8.1; named here so entries can be one line.
 | **A8** | upstream CPU | `performance.now()` around the batcher's own JS — `batchGridExact` + `emitBoundary` — with an **inert** counting context, so no deferred GPU work can hide inside the timer. This is the stage before `record`, which §1.1's model does not price (§4.11). Min of 8 reps. |
 | **A7** | acceleration verdict | `gfx.canvas.accelerated.debug = true`; the 16×16 green corner square read back through a software canvas *after* the case. A direct read of whether Gecko is still accelerating that canvas, not an inference (§3.2). |
 | **A9** | tessellated output | the 12-byte vertices Firefox's accelerated backend would upload for the frame's paths — WGR for every `fill()`, aa-stroke for every `stroke()` — computed by running those tessellators themselves (M5), and counting a path only when its cache key (§8.1) is new in the frame — a translated repeat of a shape uploads nothing (T68). Deterministic, no timer. Against `gpu-path-size` it predicts the A7 verdict of a still frame (T58, T68). |
+| **A10** | first use | a fresh source and a fresh displayed target per trial; one draw plus a 1 px read, timed, then the same draw again as the warm control. The one-off decode (and on a GPU, upload) cost that every warmed-up axis hides. Median of 7 trials (§8.1). |
 
 ### 10.5 The registry
 
@@ -8281,6 +8920,96 @@ eleven rules. The figures are generated, not drawn — `bench/optdiagrams.mjs`
 writes the schematic, `bench/optfigs.mjs` dumps the two vertex-placement
 figures out of the shipped code paths, and `bench/shotpage.html` +
 `bench/shots.mjs` render the contact sheets.
+
+**T75 — sprites: `drawImage` against a pattern `fillRect`** · *subject:* 9-arg
+`drawImage` per sprite against §4.7's pattern recipe on a rect, 1:1 and
+rotated at 1.5×, plus atlas bleed by the gutter test · *fixture:* S19, S20; M4
+(Chromium 141 `--disable-gpu`, Firefox 156 software, plus SwiftShader and
+llvmpipe runs for bleed only) and M6 (Chrome 153 Graphite, Firefox 156.0.1
+accelerated profile with no verdict, Safari 26.6.2; 4 runs, 4 runs, 1 run) ·
+*axis:* A2, A3, bleed pixel count · *numbers:* §4.13 · *reads as:* `drawImage`
+is never the loser. It is 1.46–2.25× cheaper on Chromium CPU, **5.9–7.2×**
+unscaled and **≥ 15.9×** rotated on Chrome's Graphite canvas, and **≥ 16×** on
+Safari. Firefox ties on both backends. The mechanism is the part to
+extrapolate: a sprite has no clip for the pattern to remove, so T15 does not
+carry over. On most samplers a transformed sprite bleeds whichever recipe
+draws it (≈ 44 000–48 000 px), so the atlas needs a gutter. Only Safari's
+`drawImage` and Firefox's CPU path keep it in. Many M6 `drawImage` rows sit
+on the 100 Hz refresh floor, so ratios that use them are **lower bounds**.
+*Amended at v1.92* with a second M6 round on a calibrated page (two runs
+per engine). It resolved every row the first round left on the 100 Hz floor,
+and widened the GPU gaps: Chrome **53–73×** rotated, Safari **108–169×**
+unscaled and 84–292× rotated. It also showed the first round's unfloored
+Chrome numbers were low by 4–58 %, because larger frames cost more per
+workload. Firefox's rows demote during A2 (T78), so they are mixed-regime.
+GPU bleed is now measured: Firefox's GPU canvas bleeds where its CPU path
+does not. *Supersedes the v1.71 entry*, which was CPU only and called the GPU ranking
+open because an M4 SwiftShader run ranked pattern sprites 3–5× *ahead*. A
+real GPU ranks them 5.9× and more *behind*, so that instrument's ranking was
+wrong, not only imprecise.
+
+**T76 — image source type, steady state** · *subject:* the same pixels as
+`<img>` PNG / JPEG, `ImageBitmap` and canvas, under both T75 recipes and both
+triangle recipes · *fixture:* S19, S20, M4, M6 · *axis:* A2, A3, plus a
+decoded-pixel identity check (bit-identical on every engine except the JPEG) ·
+*numbers:* §4.13 · *reads as:* a **canvas is the only source never slower**,
+on every engine and backend. On Chrome's GPU canvas a pattern made from an
+`<img>` or an `ImageBitmap` runs at CPU raster cost (A2 ÷ A3 = 1.00–1.04,
+≥ 15.8× a canvas pattern rotated). The mechanism is *unmeasured*, and the
+triangle pattern does not show it. On Firefox software an opaque source is
+1.5–1.6× faster, on both machines, by a mechanism *inferred* and not
+measured. **Reversed in part at v1.81, and again at v1.92.** v1.71's "an
+`<img>` is the slow source" (1.60× on Chromium CPU) holds on the CPU only. v1.81's "a
+canvas is the only source never slower" holds for patterns, and not for
+`drawImage`: on Safari the `<img>` is the cheapest sprite source, by
+1.37–1.46×. And on Chrome the CPU-cost pattern is a property of the 512²
+no-repeat pattern, not of small tiled ones (T78). On Chrome a whole-image
+scaled `drawImage` from an `<img>` is 2.8–4.1× its bitmap at every size (T79). On Graphite an `<img>`
+`drawImage` is within 10 % of a canvas, and the bitmap is marginally the
+dearest.
+
+**T77 — image first use** · *subject:* the first and second draw of a fresh
+2048² image, per preparation: `onload`, `img.decode()`, `createImageBitmap`,
+canvas copy · *fixture:* S21, M4, M6 · *axis:* A10 · *numbers:* §4.13, §6.18 ·
+*reads as:* a raw `<img>` pays its decode inside its first draw on every
+engine, 16.6–137 ms. `createImageBitmap` removes it everywhere (a first draw
+of 2–8 ms). `img.decode()` removes it on Firefox and Safari and **not on
+Chromium**, CPU or GPU (114.7 against 113.5 ms on M4, 28.4–29.0 against
+28.5–28.8 on M6), so it is not a portable fix. On Chrome's GPU canvas a 2048²
+`<img>` also stays slow on **every later draw** (25.3–25.8 ms against 1.8–1.9
+for a bitmap). The 512² atlas does not show it, so what triggers it is
+*unmeasured*. A canvas copy moves 27.5–75.9 ms of stall to creation. The
+fresh-browser part-F runs on M6 read up to 2.7× higher than the in-page ones,
+so the in-page ones are quoted. *Amended at v1.81* with M6. v1.71 had called
+the GPU half unmeasured.
+
+**T78 — tiled materials, the 3D-engine case** · *subject:* a `'repeat'`
+pattern against `clip` + a pre-tiled canvas and `clip` + one `drawImage` per
+tile, on tiled 4 × 4 and 1 × 1 faces, from `<img>`, `ImageBitmap` and small-canvas
+sources · *fixture:* S22, M6 (Chrome 153 Graphite, 3 runs; Firefox 156.0.1
+accelerated profile, 3 runs, every row demoted during A2; Firefox software, 1
+run; Safari 26.6.2, 3 runs) · *axis:* A2, A3, A7 per phase, and a
+same-picture RMSE check · *numbers:* §4.14 · *reads as:* the pattern ties with
+pre-tiled on Chrome and wins on Firefox (≥ 39× accelerated profile, 1.39–1.60×
+software). Pre-tiled wins on Safari by 1.11–1.80×, where the recipes' pictures
+also differ (RMSE 11.3). Per-tile `drawImage` loses 7.8–17.0× at 4 × 4
+everywhere. No source is more than 1.47× behind for a tiled pattern. **A
+control with no workload also demotes Firefox in A2**, so the sustained loop
+itself, not the recipe, fails Gecko's usage profile. That holds on M4's
+llvmpipe and on M6, and its mechanism is *unmeasured*. It makes every Firefox
+A2 on `imagepage.html` mixed-regime, and it is a caveat for any Firefox A2
+measured this way (§8.1).
+
+**T79 — per-draw cost against image size** · *subject:* 16 whole-image
+`drawImage` calls scaled into 320×180 cells, 256–4096 px, from `<img>`,
+`ImageBitmap` and canvas · *fixture:* S23, M6 (2 runs; Firefox software 1 run)
+· *axis:* A2 (each row includes one 0.996 clear per repetition) · *numbers:*
+§4.14 · *reads as:* on Chrome an `<img>` costs **2.8–4.1×** its bitmap
+wherever the bitmap row is resolved, from 256 px up, and 3.7–33.6× a canvas up
+to 2048. On Safari and Firefox the ratio stays at 0.75–1.25. 11 cheap rows
+stayed on the refresh floor despite the calibration, so Chrome's `<img>`
+against bitmap at 1024 and 2048 is bounded by the canvas only. *Mechanism
+unmeasured.* A sub-rect sprite `drawImage` does not pay it (T76).
 
 #### Overdraw and occlusion
 
